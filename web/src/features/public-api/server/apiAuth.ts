@@ -1,6 +1,7 @@
 import { env } from "@/src/env.mjs";
 import {
   createShaHash,
+  deleteApiKeyFromDb,
   recordIncrement,
   verifySecretKey,
   type AuthHeaderVerificationResult,
@@ -9,7 +10,10 @@ import {
   logger,
   instrumentAsync,
   addUserToSpan,
-  safeMultiDel,
+  invalidateCachedApiKeys as invalidateCachedApiKeysShared,
+  invalidateCachedOrgApiKeys as invalidateCachedOrgApiKeysShared,
+  invalidateCachedProjectApiKeys as invalidateCachedProjectApiKeysShared,
+  createApiKeyCacheKey,
 } from "@langfuse/shared/src/server";
 import {
   type PrismaClient,
@@ -21,8 +25,12 @@ import { isPrismaException } from "@/src/utils/exceptions";
 import { type Redis, type Cluster } from "ioredis";
 import { getOrganizationPlanServerSide } from "@/src/features/entitlements/server/getPlan";
 import { API_KEY_NON_EXISTENT } from "@langfuse/shared/src/server";
-import { type z } from "zod/v4";
+import { type z } from "zod";
 import { CloudConfigSchema, isPlan } from "@langfuse/shared";
+
+type VerifyAuthHeaderOptions = {
+  allowInAppAgentKey?: boolean;
+};
 
 export class ApiAuthService {
   prisma: PrismaClient;
@@ -36,52 +44,16 @@ export class ApiAuthService {
   // this function needs to be called, when the organisation is updated
   // - when projects move across organisations, the orgId in the API key cache needs to be updated
   // - when the plan of the org changes, the plan in the API key cache needs to be updated as well
-  async invalidate(apiKeys: ApiKey[], identifier: string) {
-    const hashKeys = apiKeys.map((key) => key.fastHashedSecretKey);
-
-    const filteredHashKeys = hashKeys.filter((hash): hash is string =>
-      Boolean(hash),
-    );
-    if (filteredHashKeys.length === 0) {
-      logger.info("No valid keys to invalidate");
-      return;
-    }
-
-    if (this.redis) {
-      logger.info(`Invalidating API keys in redis for ${identifier}`);
-      const keysToDelete = filteredHashKeys.map((hash) =>
-        this.createRedisKey(hash),
-      );
-      await safeMultiDel(this.redis, keysToDelete);
-    }
+  async invalidateCachedApiKeys(apiKeys: ApiKey[], identifier: string) {
+    await invalidateCachedApiKeysShared(apiKeys, identifier, this.redis);
   }
 
-  async invalidateOrgApiKeys(orgId: string) {
-    const apiKeys = await this.prisma.apiKey.findMany({
-      where: {
-        OR: [
-          {
-            project: {
-              orgId: orgId,
-            },
-          },
-          { orgId },
-        ],
-      },
-    });
-
-    await this.invalidate(apiKeys, `org ${orgId}`);
+  async invalidateCachedOrgApiKeys(orgId: string) {
+    await invalidateCachedOrgApiKeysShared(orgId, this.redis);
   }
 
-  async invalidateProjectApiKeys(projectId: string) {
-    const apiKeys = await this.prisma.apiKey.findMany({
-      where: {
-        projectId: projectId,
-        scope: "PROJECT",
-      },
-    });
-
-    await this.invalidate(apiKeys, `project ${projectId}`);
+  async invalidateCachedProjectApiKeys(projectId: string) {
+    await invalidateCachedProjectApiKeysShared(projectId, this.redis);
   }
 
   /**
@@ -91,38 +63,22 @@ export class ApiAuthService {
    * @param scope - The scope of the API key (either "PROJECT" or "ORGANIZATION").
    */
   async deleteApiKey(id: string, entityId: string, scope: ApiKeyScope) {
-    const entity =
-      scope === "PROJECT" ? { projectId: entityId } : { orgId: entityId };
-    // Make sure the API key exists and belongs to the project the user has access to
-    const apiKey = await this.prisma.apiKey.findFirstOrThrow({
-      where: {
-        ...entity,
-        id: id,
-        scope,
-      },
+    return deleteApiKeyFromDb({
+      prisma: this.prisma,
+      id,
+      entityId,
+      scope,
+      redis: this.redis,
     });
-    if (!apiKey) {
-      return false;
-    }
-
-    // if redis is available, delete the key from there as well
-    // delete from redis even if caching is disabled via env for consistency
-    this.invalidate([apiKey], `key ${id}`);
-
-    await this.prisma.apiKey.delete({
-      where: {
-        id: apiKey.id,
-      },
-    });
-    return true;
   }
 
   async verifyAuthHeaderAndReturnScope(
     authHeader: string | undefined,
+    options: VerifyAuthHeaderOptions = {},
   ): Promise<AuthHeaderVerificationResult> {
     const result: AuthHeaderVerificationResult = await instrumentAsync(
       { name: "api-auth-verify" },
-      async () => {
+      async (span) => {
         if (!authHeader) {
           logger.debug("No authorization header");
           return {
@@ -206,17 +162,24 @@ export class ApiAuthService {
               throw new Error("Invalid credentials");
             }
 
-            addUserToSpan({
-              projectId: finalApiKey.projectId ?? undefined,
-              orgId: finalApiKey.orgId,
-              plan,
-            });
+            addUserToSpan(
+              {
+                projectId: finalApiKey.projectId ?? undefined,
+                orgId: finalApiKey.orgId,
+                plan,
+                apiKeyId: finalApiKey.id,
+                publicKey: finalApiKey.publicKey,
+              },
+              span,
+            );
 
             const accessLevel =
-              finalApiKey.scope === "ORGANIZATION" ? "organization" : "project";
+              finalApiKey.scope === "ORGANIZATION"
+                ? ("organization" as const)
+                : ("project" as const);
 
-            return {
-              validKey: true,
+            const result = {
+              validKey: true as const,
               scope: {
                 projectId: finalApiKey.projectId,
                 accessLevel,
@@ -226,8 +189,12 @@ export class ApiAuthService {
                 apiKeyId: finalApiKey.id,
                 scope: finalApiKey.scope,
                 publicKey,
+                isIngestionSuspended: finalApiKey.isIngestionSuspended,
+                isInAppAgentKey: finalApiKey.isInAppAgentKey,
               },
             };
+
+            return result;
           }
           // Bearer auth, limited scope, only needs public key
           if (authHeader.startsWith("Bearer ")) {
@@ -241,28 +208,39 @@ export class ApiAuthService {
               );
             }
 
-            const { orgId, cloudConfig } =
+            const { orgId, cloudConfig, cloudFreeTierUsageThresholdState } =
               this.extractOrgIdAndCloudConfig(dbKey);
+            const plan = getOrganizationPlanServerSide(cloudConfig);
 
-            addUserToSpan({
-              projectId: dbKey.projectId ?? undefined,
-              orgId,
-              plan: getOrganizationPlanServerSide(cloudConfig),
-            });
+            addUserToSpan(
+              {
+                projectId: dbKey.projectId ?? undefined,
+                orgId,
+                plan,
+                apiKeyId: dbKey.id,
+                publicKey: dbKey.publicKey,
+              },
+              span,
+            );
 
-            return {
-              validKey: true,
+            const result = {
+              validKey: true as const,
               scope: {
                 projectId: dbKey.projectId,
-                accessLevel: "scores",
+                accessLevel: "scores" as const,
                 orgId,
-                plan: getOrganizationPlanServerSide(cloudConfig),
+                plan,
                 rateLimitOverrides: cloudConfig?.rateLimitOverrides ?? [],
                 apiKeyId: dbKey.id,
                 scope: dbKey.scope,
                 publicKey,
+                isInAppAgentKey: dbKey.isInAppAgentKey,
+                isIngestionSuspended:
+                  cloudFreeTierUsageThresholdState === "BLOCKED",
               },
             };
+
+            return result;
           }
         } catch (error: unknown) {
           logger.info(
@@ -287,6 +265,18 @@ export class ApiAuthService {
         };
       },
     );
+
+    if (
+      result.validKey &&
+      result.scope.isInAppAgentKey === true &&
+      options.allowInAppAgentKey !== true
+    ) {
+      return {
+        validKey: false,
+        error:
+          "Access denied - in-app agent keys are not allowed for this endpoint",
+      };
+    }
 
     return result;
   }
@@ -347,10 +337,10 @@ export class ApiAuthService {
     // add the key to redis for future use if available, this does not throw
     // only do so if the new hashkey exists already.
     if (apiKeyAndOrganisation && apiKeyAndOrganisation.fastHashedSecretKey) {
-      await this.addApiKeyToRedis(
-        hash,
-        this.convertToRedisRepresentation(apiKeyAndOrganisation),
+      const cachedApiKey = this.convertToRedisRepresentation(
+        apiKeyAndOrganisation,
       );
+      await this.addApiKeyToRedis(hash, cachedApiKey);
     }
     return apiKeyAndOrganisation
       ? this.convertToRedisRepresentation(apiKeyAndOrganisation)
@@ -367,7 +357,7 @@ export class ApiAuthService {
 
     try {
       await this.redis.set(
-        this.createRedisKey(hash),
+        createApiKeyCacheKey(hash),
         JSON.stringify(newApiKey),
         "EX",
         env.LANGFUSE_CACHE_API_KEY_TTL_SECONDS, // redis API is in seconds
@@ -384,7 +374,7 @@ export class ApiAuthService {
 
     try {
       const redisApiKey = await this.redis.getex(
-        this.createRedisKey(hash),
+        createApiKeyCacheKey(hash),
         "EX",
         env.LANGFUSE_CACHE_API_KEY_TTL_SECONDS, // redis API is in seconds
       );
@@ -404,17 +394,13 @@ export class ApiAuthService {
           "Failed to parse API key from Redis, deleting existing key from cache",
           parsedApiKey.error,
         );
-        await this.redis.del(this.createRedisKey(hash));
+        await this.redis.del(createApiKeyCacheKey(hash));
       }
       return null;
     } catch (error: unknown) {
       logger.error("Error fetching key from redis", error);
       return null;
     }
-  }
-
-  private createRedisKey(hash: string) {
-    return `api-key:${hash}`;
   }
 
   private extractOrgIdAndCloudConfig(
@@ -427,6 +413,7 @@ export class ApiAuthService {
           createdAt: Date;
           updatedAt: Date;
           cloudConfig: Prisma.JsonValue;
+          cloudFreeTierUsageThresholdState: string | null;
         };
       } | null;
     } & {
@@ -436,6 +423,7 @@ export class ApiAuthService {
         createdAt: Date;
         updatedAt: Date;
         cloudConfig: Prisma.JsonValue;
+        cloudFreeTierUsageThresholdState: string | null;
       } | null;
     },
   ) {
@@ -445,6 +433,10 @@ export class ApiAuthService {
     const rawCloudConfig =
       apiKeyAndOrganisation.project?.organization.cloudConfig ??
       apiKeyAndOrganisation.organization?.cloudConfig;
+    const cloudFreeTierUsageThresholdState =
+      apiKeyAndOrganisation.project?.organization
+        .cloudFreeTierUsageThresholdState ??
+      apiKeyAndOrganisation.organization?.cloudFreeTierUsageThresholdState;
 
     if (!orgId) {
       logger.error(
@@ -460,6 +452,7 @@ export class ApiAuthService {
     return {
       orgId,
       cloudConfig,
+      cloudFreeTierUsageThresholdState,
     };
   }
 
@@ -479,6 +472,7 @@ export class ApiAuthService {
           createdAt: Date;
           updatedAt: Date;
           cloudConfig: Prisma.JsonValue;
+          cloudFreeTierUsageThresholdState: string | null;
         };
       } | null;
     } & {
@@ -488,12 +482,12 @@ export class ApiAuthService {
         createdAt: Date;
         updatedAt: Date;
         cloudConfig: Prisma.JsonValue;
+        cloudFreeTierUsageThresholdState: string | null;
       } | null;
     },
   ) {
-    const { orgId, cloudConfig } = this.extractOrgIdAndCloudConfig(
-      apiKeyAndOrganisation,
-    );
+    const { orgId, cloudConfig, cloudFreeTierUsageThresholdState } =
+      this.extractOrgIdAndCloudConfig(apiKeyAndOrganisation);
 
     const newApiKey = OrgEnrichedApiKey.parse({
       ...apiKeyAndOrganisation,
@@ -501,6 +495,7 @@ export class ApiAuthService {
       orgId,
       plan: getOrganizationPlanServerSide(cloudConfig),
       rateLimitOverrides: cloudConfig?.rateLimitOverrides,
+      isIngestionSuspended: cloudFreeTierUsageThresholdState === "BLOCKED",
     });
 
     if (!orgId) {

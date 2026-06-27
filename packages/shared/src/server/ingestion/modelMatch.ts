@@ -5,76 +5,179 @@ import {
   recordIncrement,
   redis,
   safeMultiDel,
+  scanKeys,
 } from "../";
-import { type Cluster } from "ioredis";
+import { LocalCache } from "../cache";
 import { env } from "../../env";
 import { Decimal } from "decimal.js";
 import { prisma } from "../../db";
+import type { PricingTierWithPrices } from "../pricing-tiers";
 
 export type ModelMatchProps = {
   projectId: string;
   model: string;
 };
 
-const MODEL_MATCH_CACHE_LOCKED_KEY = "LOCK:model-match-clear";
+export type ModelWithPrices = {
+  model: Model | null;
+  pricingTiers: PricingTierWithPrices[];
+};
 
-export async function findModel(p: ModelMatchProps): Promise<Model | null> {
+const MODEL_MATCH_CACHE_LOCKED_KEY = "LOCK:model-match-clear";
+const DEFAULT_LOCAL_CACHE_MODEL_MATCH_TTL_MS = 10_000;
+const DEFAULT_LOCAL_CACHE_MODEL_MATCH_MAX = 20_000;
+// This L1 cache is intentionally TTL-only. Cross-container consistency continues
+// to come from Redis invalidation plus the short local TTL.
+const modelMatchLocalCache = new LocalCache<ModelWithPrices>({
+  namespace: "model_match",
+  enabled: env.LANGFUSE_LOCAL_CACHE_MODEL_MATCH_ENABLED === "true",
+  ttlMs: getPositiveNumberOrDefault(
+    env.LANGFUSE_LOCAL_CACHE_MODEL_MATCH_TTL_MS,
+    DEFAULT_LOCAL_CACHE_MODEL_MATCH_TTL_MS,
+  ),
+  max: getPositiveNumberOrDefault(
+    env.LANGFUSE_LOCAL_CACHE_MODEL_MATCH_MAX,
+    DEFAULT_LOCAL_CACHE_MODEL_MATCH_MAX,
+  ),
+});
+
+export async function findModel(p: ModelMatchProps): Promise<ModelWithPrices> {
   return instrumentAsync(
     {
       name: "model-match",
       traceScope: "model-match",
     },
     async (span) => {
-      logger.debug(`Finding model for ${JSON.stringify(p)}`);
-      const redisModel = await getModelFromRedis(p);
-      if (redisModel) {
-        span.setAttribute("model_match_source", "redis");
-
-        if (redisModel === NOT_FOUND_TOKEN) {
-          return null;
-        } else {
-          logger.debug(
-            `Found model name ${redisModel?.modelName} (id: ${redisModel?.id}) for project ${p.projectId} and model ${p.model}`,
-          );
-          span.setAttribute("matched_model_id", redisModel.id);
-        }
-
-        return redisModel;
+      if (logger.isLevelEnabled("debug")) {
+        logger.debug(
+          formatModelMatchDebugMessage("Resolving model match", {
+            projectId: p.projectId,
+            model: p.model,
+            localCacheEnabled:
+              env.LANGFUSE_LOCAL_CACHE_MODEL_MATCH_ENABLED === "true",
+            redisCacheEnabled:
+              env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true",
+          }),
+        );
       }
+      const localCacheKey = getRedisModelKey(p);
+      const { source, value } = await modelMatchLocalCache.getOrLoad(
+        localCacheKey,
+        async () => {
+          const cachedResult = await getModelWithPricesFromRedis(p);
+          if (cachedResult) {
+            return {
+              value: cachedResult,
+              source: "redis",
+            };
+          }
 
-      // try to find model in Postgres
-      const postgresModel = await findModelInPostgres(p);
+          const postgresModel = await findModelInPostgres(p);
+          if (postgresModel) {
+            const pricingTiers = await findPricingTiersForModel(
+              postgresModel.id,
+            );
 
-      if (postgresModel && env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true") {
-        await addModelToRedis(p, postgresModel);
+            if (env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true") {
+              await addModelWithPricingTiersToRedis(
+                p,
+                postgresModel,
+                pricingTiers,
+              );
+            }
 
-        span.setAttribute("matched_model_id", postgresModel.id);
-        span.setAttribute("model_match_source", "postgres");
-        span.setAttribute("model_cache_set", "true");
-      } else if (postgresModel) {
-        span.setAttribute("matched_model_id", postgresModel.id);
-        span.setAttribute("model_match_source", "postgres");
-        span.setAttribute("model_cache_set", "false");
-      } else {
-        span.setAttribute("model_match_source", "none");
+            return {
+              value: { model: postgresModel, pricingTiers },
+              source: "postgres",
+            };
+          }
 
-        if (env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true") {
-          await addModelNotFoundTokenToRedis(p);
+          if (env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true") {
+            await addModelNotFoundTokenToRedis(p);
+          }
+
+          return {
+            value: { model: null, pricingTiers: [] },
+            source: "none",
+          };
+        },
+      );
+
+      if (!value || value.model === null) {
+        span.setAttribute("model_match_source", source ?? "none");
+        if (
+          source === "none" &&
+          env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true"
+        ) {
           span.setAttribute("model_cache_set", "true");
         }
+
+        if (logger.isLevelEnabled("debug")) {
+          logger.debug(
+            formatModelMatchDebugMessage(
+              "Model match resolved without a model",
+              {
+                projectId: p.projectId,
+                model: p.model,
+                source: source ?? "none",
+                pricingTierCount: 0,
+              },
+            ),
+          );
+        }
+
+        return { model: null, pricingTiers: [] };
       }
 
-      logger.debug(
-        `Found model name ${postgresModel?.modelName} (id: ${postgresModel?.id}) for project ${p.projectId} and model ${p.model}`,
-      );
-      return postgresModel;
+      span.setAttribute("model_match_source", source ?? "unknown");
+      span.setAttribute("matched_model_id", value.model.id);
+      if (source === "postgres") {
+        span.setAttribute(
+          "model_cache_set",
+          String(env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "true"),
+        );
+      }
+
+      if (logger.isLevelEnabled("debug")) {
+        logger.debug(
+          formatModelMatchDebugMessage("Model match resolved", {
+            projectId: p.projectId,
+            model: p.model,
+            source: source ?? "unknown",
+            matchedModelId: value.model.id,
+            matchedModelName: value.model.modelName,
+            pricingTierCount: value.pricingTiers.length,
+          }),
+        );
+      }
+      return value;
     },
   );
 }
 
-const getModelFromRedis = async (
+const formatModelMatchDebugMessage = (
+  message: string,
+  metadata: Record<string, unknown>,
+): string => {
+  try {
+    return `${message} ${JSON.stringify(metadata)}`;
+  } catch {
+    return `${message} [unserializable]`;
+  }
+};
+
+function getPositiveNumberOrDefault(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+export const clearModelMatchLocalCache = (): void => {
+  modelMatchLocalCache.clear();
+};
+
+const getModelWithPricesFromRedis = async (
   p: ModelMatchProps,
-): Promise<Model | typeof NOT_FOUND_TOKEN | null> => {
+): Promise<ModelWithPrices | null> => {
   if (env.LANGFUSE_CACHE_MODEL_MATCH_ENABLED === "false") {
     return null;
   }
@@ -89,16 +192,39 @@ const getModelFromRedis = async (
     }
 
     const key = getRedisModelKey(p);
-    const redisModel = await redis?.get(key);
-    if (redisModel) {
-      recordIncrement("langfuse.model_match.cache_hit", 1);
-      if (redisModel === NOT_FOUND_TOKEN) {
-        return NOT_FOUND_TOKEN;
-      }
-      const model = redisModelToPrismaModel(redisModel);
-      return model;
+    const redisValue = await redis?.get(key);
+    if (!redisValue) {
+      recordIncrement("langfuse.model_match.cache_miss", 1);
+      return null;
     }
-    recordIncrement("langfuse.model_match.cache_miss", 1);
+
+    recordIncrement("langfuse.model_match.cache_hit", 1);
+
+    if (redisValue === NOT_FOUND_TOKEN) {
+      return { model: null, pricingTiers: [] };
+    }
+
+    const parsed = JSON.parse(redisValue);
+
+    if (parsed.model !== undefined && parsed.pricingTiers !== undefined) {
+      const model = redisModelToPrismaModel(parsed.model);
+      const pricingTiers: PricingTierWithPrices[] = parsed.pricingTiers.map(
+        (tier: any) => ({
+          ...tier,
+          prices: Object.entries(tier.prices).map(([usageType, price]) => ({
+            usageType,
+            price: new Decimal(price as string),
+          })),
+        }),
+      );
+
+      return { model, pricingTiers };
+    }
+
+    // Unknown format
+    logger.warn(
+      `Unknown cache format for model match: ${JSON.stringify(parsed)}`,
+    );
     return null;
   } catch (error) {
     logger.error(
@@ -108,6 +234,34 @@ const getModelFromRedis = async (
     return null;
   }
 };
+
+export async function findPricingTiersForModel(
+  modelId: string,
+): Promise<PricingTierWithPrices[]> {
+  if (!modelId) return [];
+
+  const tiers = await prisma.pricingTier.findMany({
+    where: { modelId },
+    include: {
+      prices: {
+        select: {
+          usageType: true,
+          price: true,
+        },
+      },
+    },
+    orderBy: { priority: "asc" },
+  });
+
+  return tiers.map((tier) => ({
+    id: tier.id,
+    name: tier.name,
+    isDefault: tier.isDefault,
+    priority: tier.priority,
+    conditions: tier.conditions as any, // Cast from JsonValue to PricingTierCondition[]
+    prices: tier.prices,
+  }));
+}
 
 export async function findModelInPostgres(
   p: ModelMatchProps,
@@ -132,7 +286,7 @@ export async function findModelInPostgres(
       input_price AS "inputPrice",
       output_price AS "outputPrice",
       total_price AS "totalPrice",
-      unit, 
+      unit,
       tokenizer_id AS "tokenizerId",
       tokenizer_config AS "tokenizerConfig"
     FROM
@@ -170,17 +324,34 @@ const addModelNotFoundTokenToRedis = async (p: ModelMatchProps) => {
   }
 };
 
-const addModelToRedis = async (p: ModelMatchProps, model: Model) => {
+const addModelWithPricingTiersToRedis = async (
+  p: ModelMatchProps,
+  model: Model,
+  pricingTiers: PricingTierWithPrices[],
+) => {
   try {
     const key = getRedisModelKey(p);
+
+    const cachedPricingTiers = pricingTiers.map((tier) => {
+      return {
+        ...tier,
+        prices: Object.fromEntries(
+          tier.prices.map((p) => [p.usageType, p.price]),
+        ),
+      };
+    });
+
     await redis?.set(
       key,
-      JSON.stringify(model),
+      JSON.stringify({ model, pricingTiers: cachedPricingTiers }),
       "EX",
       env.LANGFUSE_CACHE_MODEL_MATCH_TTL_SECONDS,
     );
   } catch (error) {
-    logger.error(`Error adding model for ${JSON.stringify(p)} to Redis`, error);
+    logger.error(
+      `Error adding model with pricing tiers for ${JSON.stringify(p)} to Redis`,
+      error,
+    );
   }
 };
 
@@ -193,32 +364,31 @@ const getModelMatchKeyPrefix = () => {
   if (env.REDIS_CLUSTER_ENABLED === "true") {
     // Use hash tags for Redis cluster compatibility
     // This ensures all model cache keys are placed on the same hash slot
-    return "{model-match}";
+    return "{model-price-tiers}";
   }
-  return "model-match";
+  return "model-price-tiers";
 };
 
-export const redisModelToPrismaModel = (redisModel: string): Model => {
-  const parsed: Model = JSON.parse(redisModel);
+export const redisModelToPrismaModel = (redisModel: Model): Model => {
   return {
-    ...parsed,
-    createdAt: new Date(parsed.createdAt),
-    updatedAt: new Date(parsed.updatedAt),
+    ...redisModel,
+    createdAt: new Date(redisModel.createdAt),
+    updatedAt: new Date(redisModel.updatedAt),
     inputPrice:
-      parsed.inputPrice !== null && parsed.inputPrice !== undefined
-        ? new Decimal(parsed.inputPrice)
+      redisModel.inputPrice !== null && redisModel.inputPrice !== undefined
+        ? new Decimal(redisModel.inputPrice)
         : null,
     outputPrice:
-      parsed.outputPrice !== null && parsed.outputPrice !== undefined
-        ? new Decimal(parsed.outputPrice)
+      redisModel.outputPrice !== null && redisModel.outputPrice !== undefined
+        ? new Decimal(redisModel.outputPrice)
         : null,
     totalPrice:
-      parsed.totalPrice !== null && parsed.totalPrice !== undefined
-        ? new Decimal(parsed.totalPrice)
+      redisModel.totalPrice !== null && redisModel.totalPrice !== undefined
+        ? new Decimal(redisModel.totalPrice)
         : null,
     startDate:
-      parsed.startDate !== null && parsed.startDate !== undefined
-        ? new Date(parsed.startDate)
+      redisModel.startDate !== null && redisModel.startDate !== undefined
+        ? new Date(redisModel.startDate)
         : null,
   };
 };
@@ -232,17 +402,7 @@ export async function clearModelCacheForProject(
 
   try {
     const pattern = `${getModelMatchKeyPrefix()}:${projectId}:*`;
-
-    const keys =
-      env.REDIS_CLUSTER_ENABLED === "true"
-        ? (
-            await Promise.all(
-              (redis as Cluster)
-                .nodes("master")
-                .map((node) => node.keys(pattern) || []),
-            )
-          ).flat()
-        : await redis.keys(pattern);
+    const keys = await scanKeys(redis, pattern);
 
     if (keys.length > 0) {
       await safeMultiDel(redis, keys);
@@ -293,16 +453,7 @@ export async function clearFullModelCache() {
 
     const pattern = getModelMatchKeyPrefix() + "*";
 
-    const keys =
-      env.REDIS_CLUSTER_ENABLED === "true"
-        ? (
-            await Promise.all(
-              (redis as Cluster)
-                .nodes("master")
-                .map((node) => node.keys(pattern) || []),
-            )
-          ).flat()
-        : await redis.keys(pattern);
+    const keys = await scanKeys(redis, pattern);
 
     if (keys.length > 0) {
       await safeMultiDel(redis, keys);

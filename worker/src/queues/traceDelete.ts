@@ -3,6 +3,7 @@ import {
   getCurrentSpan,
   logger,
   QueueName,
+  shouldSkipDeletionFor,
   TQueueJobTypes,
 } from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
@@ -90,6 +91,10 @@ export const traceDeleteProcessor: Processor = async (
   }
 
   try {
+    if (await shouldSkipDeletionFor(projectId, traceIdsToDelete, "trace")) {
+      return;
+    }
+
     // Delete from both Postgres and ClickHouse
     await Promise.all([
       processPostgresTraceDelete(projectId, traceIdsToDelete),

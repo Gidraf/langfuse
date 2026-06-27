@@ -1,4 +1,5 @@
 import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import {
   createTRPCRouter,
@@ -6,6 +7,7 @@ import {
 } from "@/src/server/api/trpc";
 import {
   BatchExportStatus,
+  BatchExportTableName,
   CreateBatchExportSchema,
   paginationZod,
 } from "@langfuse/shared";
@@ -15,7 +17,8 @@ import {
   QueueJobs,
 } from "@langfuse/shared/src/server";
 import { TRPCError } from "@trpc/server";
-import { z } from "zod/v4";
+import { z } from "zod";
+import { assertLegacyTracingIoSearchCanCreateBatchJob } from "@/src/features/traces/server/legacyIoSearch";
 
 export const batchExportRouter = createTRPCRouter({
   create: protectedProjectProcedure
@@ -29,8 +32,36 @@ export const batchExportRouter = createTRPCRouter({
           scope: "batchExports:create",
         });
 
-        const { projectId, query, format, name } = input;
-        logger.info("[TRPC] Creating export job", { job: input });
+        const { projectId, format, name } = input;
+
+        // Snapshot the user's v4 beta flag into the persisted query so the
+        // worker reads events-aware data sources from the dispatch-time
+        // snapshot, never the live user record. Overrides any client-sent value.
+        const query = {
+          ...input.query,
+          useEventsTable: ctx.session.user.v4BetaEnabled ?? false,
+        };
+
+        if (query.tableName === BatchExportTableName.AuditLogs) {
+          throwIfNoEntitlement({
+            entitlement: "audit-logs",
+            sessionUser: ctx.session.user,
+            projectId,
+          });
+          throwIfNoProjectAccess({
+            session: ctx.session,
+            projectId,
+            scope: "auditLogs:read",
+          });
+        }
+
+        assertLegacyTracingIoSearchCanCreateBatchJob({
+          searchQuery: query.searchQuery,
+          searchType: query.searchType,
+          tableName: query.tableName,
+        });
+
+        logger.info("[BATCH EXPORT] Creating export job", { job: input });
         const userId = ctx.session.user.id;
 
         // Create export job
@@ -66,7 +97,7 @@ export const batchExportRouter = createTRPCRouter({
           },
         });
       } catch (e) {
-        logger.error(e);
+        logger.error("[BATCH EXPORT] Failed to create export job", e);
         if (e instanceof TRPCError) {
           throw e;
         }
@@ -75,6 +106,25 @@ export const batchExportRouter = createTRPCRouter({
           message: "Creating export job failed.",
         });
       }
+    }),
+  cancel: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        batchExportId: z.string(),
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "batchExports:create",
+      });
+
+      await ctx.prisma.batchExport.update({
+        where: { id: input.batchExportId, projectId: input.projectId },
+        data: { status: BatchExportStatus.CANCELLED },
+      });
     }),
   all: protectedProjectProcedure
     .input(

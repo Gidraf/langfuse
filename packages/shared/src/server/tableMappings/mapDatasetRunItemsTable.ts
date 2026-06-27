@@ -1,4 +1,7 @@
-import { UiColumnMappings } from "../../tableDefinitions";
+import {
+  matchesUiColumnMapping,
+  UiColumnMappings,
+} from "../../tableDefinitions";
 import { DatasetRunItemDomain } from "../../domain/dataset-run-items";
 
 export const datasetRunItemsTableUiColumnDefinitions: UiColumnMappings = [
@@ -32,6 +35,18 @@ export const datasetRunItemsTableUiColumnDefinitions: UiColumnMappings = [
     clickhouseTableName: "dataset_run_items_rmt",
     clickhouseSelect: 'dri."dataset_id"',
   },
+  {
+    uiTableName: "Scores (numeric)",
+    uiTableId: "agg_scores_avg",
+    clickhouseTableName: "scores",
+    clickhouseSelect: "sa.scores_avg",
+  },
+  {
+    uiTableName: "Scores (categorical)",
+    uiTableId: "agg_score_categories",
+    clickhouseTableName: "scores",
+    clickhouseSelect: "sa.score_categories",
+  },
 ];
 
 export const mapDatasetRunItemFilterColumn = (
@@ -40,9 +55,7 @@ export const mapDatasetRunItemFilterColumn = (
 ): unknown => {
   const columnDef = datasetRunItemsTableUiColumnDefinitions.find(
     (col) =>
-      col.uiTableId === column ||
-      col.uiTableName === column ||
-      col.clickhouseSelect === column,
+      matchesUiColumnMapping(col, column) || col.clickhouseSelect === column,
   );
   if (!columnDef) {
     throw new Error(`Unhandled column for dataset run items filter: ${column}`);

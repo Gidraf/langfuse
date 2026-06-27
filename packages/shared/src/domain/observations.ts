@@ -1,4 +1,4 @@
-import z from "zod/v4";
+import z from "zod";
 import { jsonSchema } from "../utils/zod";
 import { MetadataDomain } from "./traces";
 
@@ -79,6 +79,7 @@ export const ObservationSchema = z.object({
   promptVersion: z.number().nullable(),
   latency: z.number().nullable(),
   timeToFirstToken: z.number().nullable(),
+  providedUsageDetails: z.record(z.string(), z.number()),
   usageDetails: z.record(z.string(), z.number()),
   costDetails: z.record(z.string(), z.number()),
   providedCostDetails: z.record(z.string(), z.number()),
@@ -90,15 +91,50 @@ export const ObservationSchema = z.object({
   inputUsage: z.number(),
   outputUsage: z.number(),
   totalUsage: z.number(),
+  // pricing tier information
+  usagePricingTierId: z.string().nullable(),
+  usagePricingTierName: z.string().nullable(),
+  // tool data
+  toolDefinitions: z.record(z.string(), z.string()).nullable(),
+  toolCalls: z.array(z.string()).nullable(),
+  toolCallNames: z.array(z.string()).nullable(),
 });
 
 export type Observation = z.infer<typeof ObservationSchema>;
+
+export type ObservationCoreFields = Pick<
+  Observation,
+  | "id"
+  | "traceId"
+  | "startTime"
+  | "endTime"
+  | "projectId"
+  | "parentObservationId"
+  | "type"
+>;
+
+export const EventsObservationSchema = ObservationSchema.extend({
+  userId: z.string().nullable(),
+  sessionId: z.string().nullable(),
+  traceName: z.string().nullable(),
+  release: z.string().nullable().optional(),
+  tags: z.array(z.string()).nullable().optional(),
+  bookmarked: z.boolean().optional(),
+  public: z.boolean().optional(),
+});
+
+export type EventsObservation = z.infer<typeof EventsObservationSchema>;
+
+export type PartialObservation = Partial<Observation> & ObservationCoreFields;
+
+export type PartialEventsObservation = Partial<EventsObservation> &
+  ObservationCoreFields;
 
 /**
  * Returns true if an observation type is generation-like, meaning it could include LLM calls
  * and potentially has similar input/output fields.
  */
-export const GenerationLikeObservationTypes = [
+const GenerationLikeObservationTypes = [
   ObservationType.GENERATION,
   ObservationType.AGENT,
   ObservationType.TOOL,

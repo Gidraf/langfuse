@@ -3,28 +3,45 @@ import { createTRPCContext } from "@/src/server/api/trpc";
 import { appRouter } from "@/src/server/api/root";
 import { env } from "@/src/env.mjs";
 import { logger, traceException } from "@langfuse/shared/src/server";
+import { getTRPCErrorReporting } from "@/src/server/utils/trpc-utils";
 
 export const config = {
   maxDuration: 240,
+  api: {
+    bodyParser: {
+      sizeLimit: "4.5mb",
+    },
+  },
 };
 
 // export API handler
 export default createNextApiHandler({
   router: appRouter,
   createContext: createTRPCContext,
+  // Allow queries to be sent as POST. The client only does this for the
+  // `*.batchIO` I/O queries, whose per-row payload would otherwise inflate the
+  // GET URL and trip HTTP 431 (queries opt in via the `sendAsPost` context flag;
+  // see `sendAsPostOption` in src/utils/api.ts). This flag is handler-wide (tRPC
+  // has no per-procedure option), but it only widens the accepted method for
+  // queries (read-only); mutations remain POST-only, so the GET-mutation
+  // protection is unchanged.
+  allowMethodOverride: true,
   onError: ({ path, error }) => {
-    if (error.code === "NOT_FOUND" || error.code === "UNAUTHORIZED") {
-      logger.info(
-        `tRPC route failed on ${path ?? "<no-path>"}: ${error.message}`,
-        error,
-      );
+    const { logLevel, shouldTrace } = getTRPCErrorReporting(error);
+    const message = `tRPC route failed on ${path ?? "<no-path>"}: ${error.message}`;
+
+    if (logLevel === "error") {
+      logger.error(message, error);
+    } else if (logLevel === "warn") {
+      logger.warn(message, error);
     } else {
-      logger.error(
-        `tRPC route failed on ${path ?? "<no-path>"}: ${error.message}`,
-        error,
-      );
+      logger.info(message, error);
     }
-    traceException(error);
+
+    if (shouldTrace) {
+      traceException(error);
+    }
+
     return error;
   },
   responseMeta() {

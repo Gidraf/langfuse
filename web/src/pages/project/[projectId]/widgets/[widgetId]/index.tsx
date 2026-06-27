@@ -4,9 +4,9 @@ import { api } from "@/src/utils/api";
 import { WidgetForm } from "@/src/features/widgets/components/WidgetForm";
 import { showErrorToast } from "@/src/features/notifications/showErrorToast";
 import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
-import { type DashboardWidgetChartType } from "@langfuse/shared/src/db";
-import { type views, type metricAggregations } from "@/src/features/query";
-import { type z } from "zod/v4";
+import { type DashboardWidgetChartType } from "@langfuse/shared";
+import { type metricAggregations, type views } from "@langfuse/shared/query";
+import { type z } from "zod";
 import { type WidgetChartConfig } from "@/src/features/widgets/utils";
 
 export default function EditWidget() {
@@ -18,6 +18,7 @@ export default function EditWidget() {
   };
 
   // Fetch the widget details
+  const utils = api.useUtils();
   const { data: widgetData, isLoading: isWidgetLoading } =
     api.dashboardWidgets.get.useQuery(
       {
@@ -31,6 +32,9 @@ export default function EditWidget() {
 
   // Update widget mutation
   const updateWidgetMutation = api.dashboardWidgets.update.useMutation({
+    onSettled: () => {
+      utils.dashboardWidgets.invalidate();
+    },
     onSuccess: () => {
       showSuccessToast({
         title: "Widget updated successfully",
@@ -38,11 +42,11 @@ export default function EditWidget() {
       });
       // Navigate back to dashboard if provided else widgets list
       if (dashboardId) {
-        void router.push(
+        router.push(
           `/project/${projectId}/dashboards/${dashboardId}?addWidgetId=${widgetId}`,
         );
       } else {
-        void router.push(`/project/${projectId}/widgets`);
+        router.push(`/project/${projectId}/widgets`);
       }
     },
     onError: (error) => {
@@ -60,6 +64,7 @@ export default function EditWidget() {
     filters: any[];
     chartType: DashboardWidgetChartType;
     chartConfig: WidgetChartConfig;
+    minVersion: number;
   }) => {
     if (!widgetId) return;
 
@@ -77,6 +82,7 @@ export default function EditWidget() {
       filters: widgetFormData.filters,
       chartType: widgetFormData.chartType,
       chartConfig: widgetFormData.chartConfig,
+      minVersion: widgetFormData.minVersion,
     });
   };
 
@@ -112,6 +118,7 @@ export default function EditWidget() {
             filters: widgetData.filters,
             chartType: widgetData.chartType,
             chartConfig: widgetData.chartConfig,
+            minVersion: widgetData.minVersion,
           }}
         />
       ) : (

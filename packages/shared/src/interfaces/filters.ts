@@ -1,4 +1,4 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 
 // Make sure to update the InMemoryFilterService if you add new filter types
 export const filterOperators = {
@@ -18,7 +18,11 @@ export const filterOperators = {
   numberObject: ["=", ">", "<", ">=", "<="],
   boolean: ["=", "<>"],
   null: ["is null", "is not null"],
+  positionInTrace: ["="],
 } as const;
+
+export const FTS_MATCH_OPERATOR = "matches" as const;
+export type FtsMatchOperator = typeof FTS_MATCH_OPERATOR;
 
 export const timeFilter = z.object({
   column: z.string(),
@@ -45,12 +49,23 @@ export const stringOptionsFilter = z.object({
   value: z.array(z.string()).refine((v) => v.length > 0),
   type: z.literal("stringOptions"),
 });
-export const arrayOptionsFilter = z.object({
-  column: z.string(),
-  operator: z.enum(filterOperators.arrayOptions),
-  value: z.array(z.string()).refine((v) => v.length > 0),
-  type: z.literal("arrayOptions"),
-});
+export const arrayOptionsFilter = z
+  .object({
+    column: z.string(),
+    operator: z.enum(filterOperators.arrayOptions),
+    value: z.array(z.string()),
+    type: z.literal("arrayOptions"),
+  })
+  .refine(
+    (data) =>
+      data.operator === "all of" ||
+      data.operator === "none of" ||
+      data.value.length > 0,
+    {
+      message:
+        "Value array must not be empty unless operator is 'all of' or 'none of' (which represent waiting for selection)",
+    },
+  );
 export const stringObjectFilter = z.object({
   type: z.literal("stringObject"),
   column: z.string(),
@@ -77,6 +92,24 @@ export const nullFilter = z.object({
   operator: z.enum(filterOperators.null),
   value: z.literal(""),
 });
+export const positionInTraceFilter = z
+  .object({
+    type: z.literal("positionInTrace"),
+    column: z.string(),
+    operator: z.literal("="),
+    key: z.enum(["root", "first", "last", "nthFromEnd", "nthFromStart"]),
+    value: z.number().optional(),
+  })
+  .superRefine((data, ctx) => {
+    const needsValue = data.key === "nthFromEnd" || data.key === "nthFromStart";
+    if (needsValue && (!data.value || data.value < 1)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Position must be >= 1 for nth selection",
+        path: ["value"],
+      });
+    }
+  });
 export const categoryOptionsFilter = z.object({
   type: z.literal("categoryOptions"),
   column: z.string(),
@@ -95,4 +128,39 @@ export const singleFilter = z.discriminatedUnion("type", [
   numberObjectFilter,
   booleanFilter,
   nullFilter,
+  positionInTraceFilter,
 ]);
+
+const eventsTableStringOperator = z.union([
+  z.enum(filterOperators.string),
+  z.literal(FTS_MATCH_OPERATOR),
+]);
+
+const eventsTableStringObjectOperator = z.union([
+  z.enum(filterOperators.stringObject),
+  z.literal(FTS_MATCH_OPERATOR),
+]);
+
+export const eventsTableStringFilter = stringFilter.extend({
+  operator: eventsTableStringOperator,
+});
+
+export const eventsTableStringObjectFilter = stringObjectFilter.extend({
+  operator: eventsTableStringObjectOperator,
+});
+
+export const eventsTableSingleFilter = z.discriminatedUnion("type", [
+  timeFilter,
+  eventsTableStringFilter,
+  numberFilter,
+  stringOptionsFilter,
+  categoryOptionsFilter,
+  arrayOptionsFilter,
+  eventsTableStringObjectFilter,
+  numberObjectFilter,
+  booleanFilter,
+  nullFilter,
+  positionInTraceFilter,
+]);
+
+export const eventsTableFilterState = z.array(eventsTableSingleFilter);

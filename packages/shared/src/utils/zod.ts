@@ -1,5 +1,5 @@
 import { InputJsonValue } from "@prisma/client/runtime/library";
-import { z } from "zod/v4";
+import { z } from "zod";
 
 // to be used for Prisma JSON type
 // @see: https://github.com/colinhacks/zod#json-type
@@ -39,15 +39,19 @@ export const jsonSchema: z.ZodType<Json> = z.lazy(() =>
   ]),
 );
 
+export const paginationLimitZod = z.preprocess(
+  (x) => (x === "" ? undefined : x),
+  z.coerce.number().int().gte(1).lte(100).default(50),
+);
+
+export const publicApiPaginationLimitZod = paginationLimitZod;
+
 export const paginationZod = {
   page: z.preprocess(
     (x) => (x === "" ? undefined : x),
     z.coerce.number().nonnegative().default(1),
   ),
-  limit: z.preprocess(
-    (x) => (x === "" ? undefined : x),
-    z.coerce.number().nonnegative().lte(100).default(50),
-  ),
+  limit: paginationLimitZod,
 };
 
 export const publicApiPaginationZod = {
@@ -55,11 +59,65 @@ export const publicApiPaginationZod = {
     (x) => (x === "" ? undefined : x),
     z.coerce.number().gt(0).default(1),
   ),
-  limit: z.preprocess(
-    (x) => (x === "" ? undefined : x),
-    z.coerce.number().lte(100).default(50),
-  ),
+  limit: publicApiPaginationLimitZod,
 };
+
+const splitCommaSeparatedQueryParam = (value: string) =>
+  value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+export const optionalCommaSeparatedStringArray = z
+  .string()
+  .nullish()
+  .transform((value) => {
+    if (!value) return undefined;
+
+    const values = splitCommaSeparatedQueryParam(value);
+    return values.length > 0 ? values : undefined;
+  });
+
+type CommaSeparatedEnumArrayOptions = {
+  unknownValues?: "reject" | "filter";
+};
+
+type CommaSeparatedEnumArrayOutput<
+  TValues extends readonly [string, ...string[]],
+  TDefault extends Array<TValues[number]> | null,
+> = TDefault extends null
+  ? Array<TValues[number]> | null
+  : Array<TValues[number]>;
+
+export function commaSeparatedEnumArray<
+  const TValues extends readonly [string, ...string[]],
+  const TDefault extends Array<TValues[number]> | null,
+>(
+  values: TValues,
+  defaultValue: TDefault,
+  options?: CommaSeparatedEnumArrayOptions,
+): z.ZodType<CommaSeparatedEnumArrayOutput<TValues, TDefault>> {
+  const arraySchema = z.array(z.enum(values));
+  const schema =
+    defaultValue === null
+      ? arraySchema.nullable().default(null)
+      : arraySchema.default(defaultValue);
+
+  return z.preprocess((value) => {
+    if (value === null || value === undefined || value === "") return undefined;
+    if (typeof value !== "string") return value;
+
+    const items = splitCommaSeparatedQueryParam(value);
+
+    if (options?.unknownValues === "filter") {
+      return items.filter((item): item is TValues[number] =>
+        values.includes(item as TValues[number]),
+      );
+    }
+
+    return items;
+  }, schema) as z.ZodType<CommaSeparatedEnumArrayOutput<TValues, TDefault>>;
+}
 
 export const optionalPaginationZod = {
   page: z
@@ -86,7 +144,7 @@ export const noUrlCheck = (value: string) => !urlRegex.test(value);
 
 export const NonEmptyString = z.string().min(1);
 
-export const htmlRegex = /<[^>]*>/;
+export const htmlRegex = /<[^>]*>/g;
 
 export const StringNoHTML = z.string().refine((val) => !htmlRegex.test(val), {
   message: "Text cannot contain HTML tags",
@@ -106,7 +164,7 @@ export const StringNoHTMLNonEmpty = z
  * @param object - The object to be validated.
  * @returns The parsed object if validation is successful.
  */
-export const validateZodSchema = <T extends z.ZodTypeAny>(
+export const validateZodSchema = <T extends z.ZodType>(
   schema: T,
   object: z.infer<T>,
 ): z.infer<T> => {
@@ -116,7 +174,7 @@ export const validateZodSchema = <T extends z.ZodTypeAny>(
 // JSON Schema validation
 export const JSONPrimitiveValueSchema = z.union([
   z.string(),
-  z.number().finite(),
+  z.number(),
   z.boolean(),
 ]);
 
@@ -135,3 +193,53 @@ export type JSONPrimitiveValue = z.infer<typeof JSONPrimitiveValueSchema>;
 export type JSONValue = z.infer<typeof JSONValueSchema>;
 export type JSONObject = z.infer<typeof JSONObjectSchema>;
 export type JSONArray = z.infer<typeof JSONArraySchema>;
+
+/**
+ * Sanitizes a string for safe use in email subject lines.
+ * Prevents email header injection attacks by removing:
+ * - Newline characters (\r, \n) which can be used for CRLF injection
+ * - Control characters (ASCII 0-31 and 127) which can cause parsing issues
+ * - HTML tags (defensive, though nodemailer should handle this)
+ *
+ * This is critical for security compliance as it prevents attackers from:
+ * - Injecting additional email headers (BCC, CC, From, etc.)
+ * - Manipulating email routing
+ * - Executing XSS in email clients
+ *
+ * @param input - The string to sanitize (e.g., user name, project name)
+ * @returns Sanitized string safe for email subject lines
+ *
+ * @example
+ * sanitizeEmailSubject("John\r\nBCC: attacker@evil.com") // Returns "JohnBCC: attacker@evil.com"
+ * sanitizeEmailSubject("Test<script>alert(1)</script>") // Returns "Testscriptalert(1)/script"
+ */
+export function sanitizeEmailSubject(input: string): string {
+  return (
+    input
+      // Remove carriage return and line feed (CRLF injection prevention)
+      .replace(/[\r\n]/g, "")
+      // Remove all control characters (ASCII 0-31 and 127)
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\x00-\x1F\x7F]/g, "")
+      // Remove HTML tags (defensive layer)
+      .replace(htmlRegex, "")
+      // Trim whitespace
+      .trim()
+  );
+}
+
+/**
+ * Zod schema for optional ISO 8601 timestamp strings (RFC 3339, Section 5.6) in UTC.
+ * Used for dataset versioning to allow querying data at a specific point in time.
+ *
+ * Behavior:
+ * - If provided, must be a valid ISO 8601 string (e.g., "2026-01-21T14:35:42Z")
+ * - Coerces to Date object
+ * - If undefined, treated as optional (returns latest version)
+ *
+ * @example
+ * // Valid inputs
+ * versionZod.parse("2026-01-21T14:35:42Z") // Returns Date object
+ * versionZod.parse(undefined) // Returns undefined
+ */
+export const versionZod = z.coerce.date().optional();

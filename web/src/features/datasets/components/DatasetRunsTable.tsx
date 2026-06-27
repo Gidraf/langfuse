@@ -7,7 +7,7 @@ import { formatIntervalSeconds } from "@/src/utils/dates";
 import { useQueryParams, withDefault, NumberParam } from "use-query-params";
 import { type RouterOutput } from "@/src/utils/types";
 import { useEffect, useMemo, useState } from "react";
-import { usdFormatter } from "../../../utils/numbers";
+import { usdFormatter } from "@/src/utils/numbers";
 import { DataTableToolbar } from "@/src/components/table/data-table-toolbar";
 import useColumnVisibility from "@/src/features/column-visibility/hooks/useColumnVisibility";
 import { type Prisma, datasetRunsTableColsWithOptions } from "@langfuse/shared";
@@ -36,9 +36,12 @@ import {
   RESOURCE_METRICS,
   transformAggregatedRunMetricsToChartData,
 } from "@/src/features/dashboard/lib/score-analytics-utils";
-import { TimeseriesChart } from "@/src/features/scores/components/TimeseriesChart";
+import {
+  compareViewChartDataToDataPoints,
+  getCompareViewChartUnit,
+} from "@/src/features/dashboard/lib/chart-data-adapters";
+import { Chart } from "@/src/features/widgets/chart-library/Chart";
 import { CompareViewAdapter } from "@/src/features/scores/adapters";
-import { isNumericDataType } from "@/src/features/scores/lib/helpers";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import { LocalIsoDate } from "@/src/components/LocalIsoDate";
 import {
@@ -59,9 +62,10 @@ import { useScoreColumns } from "@/src/features/scores/hooks/useScoreColumns";
 import {
   scoreFilters,
   addPrefixToScoreKeys,
-  getScoreDataTypeIcon,
   convertScoreColumnsToAnalyticsData,
 } from "@/src/features/scores/lib/scoreColumns";
+import { getScoreLabelFromKey } from "@/src/features/scores/lib/aggregateScores";
+import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
 
 export type DatasetRunRowData = {
   id: string;
@@ -70,6 +74,7 @@ export type DatasetRunRowData = {
   countRunItems: string;
   avgLatency: number | undefined;
   avgTotalCost: string | undefined;
+  totalCost: string | undefined;
   // scores holds grouped column with individual scores
   runItemScores?: ScoreAggregate | undefined;
   runScores?: ScoreAggregate | undefined;
@@ -113,16 +118,12 @@ const DatasetRunTableMultiSelectAction = ({
         <DropdownMenuContent key="dropdown-menu-content">
           <Link
             key="compare"
-            href={
-              selectedRunIds.length < 2
-                ? "#"
-                : {
-                    pathname: `/project/${projectId}/datasets/${datasetId}/compare`,
-                    query: { runs: selectedRunIds },
-                  }
-            }
+            href={{
+              pathname: `/project/${projectId}/datasets/${datasetId}/compare`,
+              query: { runs: selectedRunIds },
+            }}
           >
-            <DropdownMenuItem disabled={selectedRunIds.length < 2}>
+            <DropdownMenuItem>
               <Columns3 className="mr-2 h-4 w-4" />
               <span>Compare</span>
             </DropdownMenuItem>
@@ -149,7 +150,7 @@ const DatasetRunTableMultiSelectAction = ({
         <DialogContent className="sm:max-w-xl">
           <DialogHeader>
             <DialogTitle className="mb-4">Please confirm</DialogTitle>
-            <DialogDescription className="text-md p-0">
+            <DialogDescription className="p-0">
               This action cannot be undone and removes all the data associated
               with {selectedRunIds.length} dataset run
               {selectedRunIds.length > 1 ? "s" : ""}.
@@ -171,7 +172,7 @@ const DatasetRunTableMultiSelectAction = ({
                 setIsDeleteDialogOpen(false);
               }}
             >
-              Delete Dataset Runs
+              Delete Experiments
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -274,12 +275,15 @@ export function DatasetRunsTable(props: {
 
   const { scoreColumns, isLoading: isColumnLoading } =
     useScoreColumns<DatasetRunRowData>({
+      displayFormat: "aggregate",
       scoreColumnKey: "runItemScores",
       projectId: props.projectId,
-      filter: scoreFilters.forDatasetRunItems({
-        datasetRunIds: runs.data?.runs.map((r) => r.id) ?? [],
-        datasetId: props.datasetId,
-      }),
+      filter: runs.data?.runs?.length
+        ? scoreFilters.forDatasetRunItems({
+            datasetRunIds: runs.data.runs.map((r) => r.id),
+            datasetId: props.datasetId,
+          })
+        : [],
       isFilterDataPending: runs.isPending,
     });
 
@@ -287,9 +291,11 @@ export function DatasetRunsTable(props: {
     useScoreColumns<DatasetRunRowData>({
       scoreColumnKey: "runScores",
       projectId: props.projectId,
-      filter: scoreFilters.forDatasetRuns({
-        datasetRunIds: runs.data?.runs.map((r) => r.id) ?? [],
-      }),
+      filter: runs.data?.runs?.length
+        ? scoreFilters.forDatasetRuns({
+            datasetRunIds: runs.data?.runs.map((r) => r.id),
+          })
+        : [],
       prefix: "Run-level",
       isFilterDataPending: runs.isPending,
     });
@@ -297,10 +303,12 @@ export function DatasetRunsTable(props: {
   const scoreKeysAndProps = api.scores.getScoreColumns.useQuery(
     {
       projectId: props.projectId,
-      filter: scoreFilters.forDatasetRunItems({
-        datasetRunIds: runs.data?.runs.map((r) => r.id) ?? [],
-        datasetId: props.datasetId,
-      }),
+      filter: runs.data?.runs?.length
+        ? scoreFilters.forDatasetRunItems({
+            datasetRunIds: runs.data?.runs.map((r) => r.id),
+            datasetId: props.datasetId,
+          })
+        : [],
     },
     {
       enabled: runs.isSuccess,
@@ -321,7 +329,7 @@ export function DatasetRunsTable(props: {
     );
   }, [runsMetrics.data, scoreIdToName]);
 
-  const { scoreAnalyticsOptions, scoreKeyToData } = useMemo(
+  const { scoreAnalyticsOptions } = useMemo(
     () =>
       convertScoreColumnsToAnalyticsData(scoreKeysAndProps.data?.scoreColumns),
     [scoreKeysAndProps.data?.scoreColumns],
@@ -367,7 +375,7 @@ export function DatasetRunsTable(props: {
             checked={row.getIsSelected()}
             onCheckedChange={(value) => row.toggleSelected(!!value)}
             aria-label="Select row"
-            className="mt-1 opacity-60 data-[state=checked]:mt-[5px]"
+            className="opacity-60"
           />
         );
       },
@@ -416,11 +424,7 @@ export function DatasetRunsTable(props: {
       cell: ({ row }) => {
         const description: DatasetRunRowData["description"] =
           row.getValue("description");
-        return (
-          <div className="max-h-full max-w-full overflow-y-auto overflow-x-hidden break-words">
-            {description}
-          </div>
-        );
+        return description;
       },
     },
     {
@@ -453,7 +457,7 @@ export function DatasetRunsTable(props: {
     },
     {
       accessorKey: "avgTotalCost",
-      header: "Total Cost (avg)",
+      header: "Trace Cost (avg)",
       id: "avgTotalCost",
       size: 130,
       enableHiding: true,
@@ -463,6 +467,20 @@ export function DatasetRunsTable(props: {
         if (!avgTotalCost || runsMetrics.isPending)
           return <Skeleton className="h-3 w-1/2" />;
         return <>{avgTotalCost}</>;
+      },
+    },
+    {
+      accessorKey: "totalCost",
+      header: "Trace Cost (sum)",
+      id: "totalCost",
+      size: 130,
+      enableHiding: true,
+      cell: ({ row }) => {
+        const totalCost: DatasetRunRowData["totalCost"] =
+          row.getValue("totalCost");
+        if (!totalCost || runsMetrics.isPending)
+          return <Skeleton className="h-3 w-1/2" />;
+        return <>{totalCost}</>;
       },
     },
     {
@@ -526,7 +544,7 @@ export function DatasetRunsTable(props: {
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="ghost" className="h-8 w-8 p-0">
-                <span className="sr-only [position:relative]">Open menu</span>
+                <span className="sr-only relative">Open menu</span>
                 <MoreVertical className="h-4 w-4" />
               </Button>
             </DropdownMenuTrigger>
@@ -556,6 +574,9 @@ export function DatasetRunsTable(props: {
       avgTotalCost: item.avgTotalCost
         ? usdFormatter(item.avgTotalCost.toNumber())
         : usdFormatter(0),
+      totalCost: item.totalCost
+        ? usdFormatter(item.totalCost.toNumber())
+        : usdFormatter(0),
       runItemScores: item.scores,
       runScores: item.runScores
         ? addPrefixToScoreKeys(item.runScores, "Run-level")
@@ -577,68 +598,106 @@ export function DatasetRunsTable(props: {
   );
 
   // Check if we have charts to display
-  const hasCharts =
-    Boolean(props.selectedMetrics.length) &&
-    Boolean(runAggregatedMetrics?.size);
+  const hasCharts = Boolean(props.selectedMetrics.length);
 
   return (
     <>
       {hasCharts ? (
         <ResizablePanelGroup
-          direction="vertical"
+          orientation="vertical"
           className="h-full"
-          onLayout={(sizes) => {
-            setChartsPanelSize(sizes[0]);
+          onLayoutChanged={(layout) => {
+            const charts = layout["dataset-charts"];
+            if (charts != null) setChartsPanelSize(charts);
           }}
         >
           <ResizablePanel
-            defaultSize={chartsPanelSize}
-            minSize={20}
+            id="dataset-charts"
+            defaultSize={`${chartsPanelSize}%`}
+            minSize="20%"
             className="overflow-hidden"
           >
             <div className="h-full w-full overflow-x-auto overflow-y-auto p-3">
               <div className="flex h-full w-full gap-4">
                 {props.selectedMetrics.map((key) => {
+                  const title =
+                    RESOURCE_METRICS.find((metric) => metric.key === key)
+                      ?.label ?? getScoreLabelFromKey(key);
+
+                  if (!Boolean(runAggregatedMetrics?.size)) {
+                    return (
+                      <div
+                        key={key}
+                        className="flex h-full max-w-full min-w-80 flex-col gap-2"
+                      >
+                        <span className="shrink-0 text-sm font-medium">
+                          {title}
+                        </span>
+                        <NoDataOrLoading
+                          isLoading={runsMetrics.isPending}
+                          className="min-h-[200px]"
+                        />
+                      </div>
+                    );
+                  }
+
                   const adapter = new CompareViewAdapter(
                     runAggregatedMetrics,
                     key,
                   );
                   const { chartData, chartLabels } = adapter.toChartData();
 
-                  const scoreData = scoreKeyToData.get(key);
-                  if (!scoreData)
+                  const dataPoints = compareViewChartDataToDataPoints(
+                    chartData,
+                    chartLabels,
+                    key,
+                  );
+
+                  const chartType =
+                    chartLabels.length === 1
+                      ? "LINE_TIME_SERIES"
+                      : "BAR_TIME_SERIES";
+
+                  if (dataPoints.length === 0) {
                     return (
-                      <div key={key} className="h-full min-w-80 max-w-full">
-                        <TimeseriesChart
-                          chartData={chartData}
-                          chartLabels={chartLabels}
-                          title={
-                            RESOURCE_METRICS.find(
-                              (metric) => metric.key === key,
-                            )?.label ?? key
-                          }
-                          type="numeric"
-                          maxFractionDigits={
-                            RESOURCE_METRICS.find(
-                              (metric) => metric.key === key,
-                            )?.maxFractionDigits
-                          }
+                      <div
+                        key={key}
+                        className="flex h-full max-w-full min-w-80 flex-col gap-2"
+                      >
+                        <span className="shrink-0 text-sm font-medium">
+                          {title}
+                        </span>
+                        <NoDataOrLoading
+                          isLoading={runsMetrics.isPending}
+                          description="No chart data available for the selected runs."
+                          className="min-h-[200px]"
                         />
                       </div>
                     );
+                  }
 
                   return (
-                    <div key={key} className="h-full min-w-80 max-w-full">
-                      <TimeseriesChart
-                        chartData={chartData}
-                        chartLabels={chartLabels}
-                        title={`${getScoreDataTypeIcon(scoreData.dataType)} ${scoreData.name} (${scoreData.source.toLowerCase()})`}
-                        type={
-                          isNumericDataType(scoreData.dataType)
-                            ? "numeric"
-                            : "categorical"
-                        }
-                      />
+                    <div
+                      key={key}
+                      className="flex h-full max-w-full min-w-80 flex-col gap-2"
+                    >
+                      <span className="shrink-0 text-sm font-medium">
+                        {title}
+                      </span>
+                      <div className="min-h-[200px] min-w-0 flex-1">
+                        <Chart
+                          chartType={chartType}
+                          data={dataPoints}
+                          rowLimit={Math.max(dataPoints.length, 1)}
+                          chartConfig={{
+                            type: chartType,
+                            unit: getCompareViewChartUnit(key),
+                          }}
+                          legendPosition={
+                            chartLabels.length > 1 ? "above" : "none"
+                          }
+                        />
+                      </div>
                     </div>
                   );
                 })}
@@ -647,7 +706,7 @@ export function DatasetRunsTable(props: {
           </ResizablePanel>
           <ResizableHandle withHandle className="bg-border" />
           <ResizablePanel
-            minSize={40}
+            minSize="40%"
             className="flex h-full flex-1 flex-col overflow-hidden"
           >
             <DataTableToolbar
@@ -666,6 +725,7 @@ export function DatasetRunsTable(props: {
                   runs.data?.runs.map((run) => run.id).includes(runId),
                 ).length > 0 ? (
                   <DatasetRunTableMultiSelectAction
+                    key="multi-select-action"
                     // Exclude items that are not in the current page
                     selectedRunIds={Object.keys(selectedRows).filter((runId) =>
                       runs.data?.runs.map((run) => run.id).includes(runId),

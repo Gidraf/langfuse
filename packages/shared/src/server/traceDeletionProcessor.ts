@@ -4,6 +4,7 @@ import { TraceDeleteQueue } from "./redis/traceDelete";
 import { QueueJobs } from "./queues";
 import { logger } from "./logger";
 import { env } from "../env";
+import { shouldSkipDeletionFor } from "./deletionGuard";
 
 export interface TraceDeletionProcessorOptions {
   delayMs?: number; // Default from LANGFUSE_TRACE_DELETE_DELAY_MS env var
@@ -44,6 +45,10 @@ export async function traceDeletionProcessor(
       delayMs,
     },
   );
+
+  if (await shouldSkipDeletionFor(projectId, traceIds, "trace")) {
+    return; // Early return - don't create pending_deletions or queue job
+  }
 
   try {
     // Create pending deletion records for all traces

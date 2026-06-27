@@ -1,4 +1,4 @@
-import z from "zod/v4";
+import z from "zod";
 import { jsonSchema } from "../utils/zod";
 import { MetadataDomain } from "./traces";
 
@@ -23,6 +23,17 @@ export const DatasetRunItemSchema = z.object({
   datasetItemInput: jsonSchema,
   datasetItemExpectedOutput: jsonSchema,
   datasetItemMetadata: MetadataDomain,
+  datasetItemVersion: z.date().nullable(),
 });
 
-export type DatasetRunItemDomain = z.infer<typeof DatasetRunItemSchema>;
+// Conditional type for dataset run item domain with optional IO
+export type DatasetRunItemDomain<WithIO extends boolean = true> =
+  WithIO extends true
+    ? z.infer<typeof DatasetRunItemSchema>
+    : Omit<
+        z.infer<typeof DatasetRunItemSchema>,
+        | "datasetRunMetadata"
+        | "datasetItemInput"
+        | "datasetItemExpectedOutput"
+        | "datasetItemMetadata"
+      >;

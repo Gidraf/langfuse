@@ -1,28 +1,22 @@
 import { createPrompt } from "@/src/features/prompts/server/actions/createPrompt";
+import { getPromptByName } from "@/src/features/prompts/server/actions/getPromptByName";
 import { ApiAuthService } from "@/src/features/public-api/server/apiAuth";
 import { cors, runMiddleware } from "@/src/features/public-api/server/cors";
+import { isZodError } from "@/src/features/public-api/server/withMiddlewares";
 import { prisma } from "@langfuse/shared/src/db";
 import { isPrismaException } from "@/src/utils/exceptions";
 import { type NextApiRequest, type NextApiResponse } from "next";
-import { z } from "zod/v4";
 import {
   UnauthorizedError,
   LangfuseNotFoundError,
   BaseError,
   MethodNotAllowedError,
   ForbiddenError,
-  type Prompt,
   GetPromptSchema,
   LegacyCreatePromptSchema,
   PRODUCTION_LABEL,
 } from "@langfuse/shared";
-import {
-  PromptService,
-  redis,
-  recordIncrement,
-  traceException,
-  logger,
-} from "@langfuse/shared/src/server";
+import { redis, traceException, logger } from "@langfuse/shared/src/server";
 import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
 import { telemetry } from "@/src/features/telemetry";
 
@@ -68,25 +62,11 @@ export default async function handler(
         return rateLimitCheck.sendRestResponseIfLimited(res);
       }
 
-      const promptService = new PromptService(prisma, redis, recordIncrement);
-
-      let prompt: Prompt | null = null;
-
-      if (version) {
-        prompt = await promptService.getPrompt({
-          projectId,
-          promptName,
-          version,
-          label: undefined,
-        });
-      } else {
-        prompt = await promptService.getPrompt({
-          projectId,
-          promptName,
-          label: PRODUCTION_LABEL,
-          version: undefined,
-        });
-      }
+      const prompt = await getPromptByName({
+        promptName,
+        projectId,
+        version,
+      });
 
       if (!prompt) throw new LangfuseNotFoundError("Prompt not found");
 
@@ -98,6 +78,16 @@ export default async function handler(
 
     // Handle POST requests
     if (req.method === "POST") {
+      const rateLimitCheck =
+        await RateLimitService.getInstance().rateLimitRequest(
+          authCheck.scope,
+          "prompts",
+        );
+
+      if (rateLimitCheck?.isRateLimited()) {
+        return rateLimitCheck.sendRestResponseIfLimited(res);
+      }
+
       const input = LegacyCreatePromptSchema.parse(req.body);
       const prompt = await createPrompt({
         ...input,
@@ -118,26 +108,32 @@ export default async function handler(
 
     throw new MethodNotAllowedError();
   } catch (error: unknown) {
-    logger.error(error);
-    traceException(error);
-
     if (error instanceof BaseError) {
+      if (!error.isUserError()) {
+        logger.error(error);
+        traceException(error);
+      }
+
       return res.status(error.httpCode).json({
         error: error.name,
         message: error.message,
       });
     }
 
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
-      });
-    }
-
-    if (error instanceof z.ZodError) {
+    if (isZodError(error)) {
+      logger.warn(`Zod exception`, { issues: error.issues });
       return res.status(400).json({
         message: "Invalid request data",
         error: error.issues,
+      });
+    }
+
+    logger.error(error);
+    traceException(error);
+
+    if (isPrismaException(error)) {
+      return res.status(500).json({
+        error: "Internal Server Error",
       });
     }
 

@@ -1,4 +1,4 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   ChatMessageType,
   PlaceholderMessageSchema,
@@ -78,7 +78,7 @@ function validateJson(content: string): boolean {
     JSON.parse(content);
 
     return true;
-  } catch (e) {
+  } catch (_e) {
     return false;
   }
 }

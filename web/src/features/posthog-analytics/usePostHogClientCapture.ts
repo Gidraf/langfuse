@@ -1,8 +1,12 @@
 import { type CaptureResult, type CaptureOptions } from "posthog-js";
 import { usePostHog } from "posthog-js/react";
 
+export const V4_BETA_ENABLED_POSTHOG_PROPERTY = "v4BetaEnabled";
+
 // resource:action, only use snake_case
-const events = {
+// Exported to silence @typescript-eslint/no-unused-vars v8 warning
+// (used for type extraction via typeof, which is a legitimate pattern)
+export const events = {
   table: [
     "filter_builder_open",
     "filter_builder_close",
@@ -28,6 +32,8 @@ const events = {
     "test_in_playground_button_click",
     "display_mode_switch",
     "download_button_click",
+    "view_mode_switch",
+    "tree_panel_toggle",
   ],
   generations: ["export"],
   saved_views: [
@@ -45,6 +51,7 @@ const events = {
     "permalink_visit",
     "update_name",
     "search_views",
+    "system_preset_selected",
   ],
   score: [
     "create",
@@ -57,6 +64,7 @@ const events = {
   ],
   score_configs: [
     "create_form_submit",
+    "update_form_submit",
     "manage_configs_item_click",
     "archive_form_open",
     "archive_form_submit",
@@ -77,7 +85,7 @@ const events = {
     "duplicate_button_click",
     "duplicate_form_submit",
   ],
-  session_detail: ["publish_button_click"],
+  session_detail: ["publish_button_click", "download_button_click"],
   eval_config: [
     "new_form_submit",
     "new_form_open",
@@ -96,9 +104,18 @@ const events = {
     "delete_form_open",
     "delete_template_button_click",
   ],
-  integrations: ["posthog_form_submitted", "blob_storage_form_submitted"],
+  integrations: [
+    "posthog_form_submitted",
+    "blob_storage_form_submitted",
+    "mixpanel_form_submitted",
+  ],
   sign_in: ["cloud_region_switch", "button_click"],
-  auth: ["reset_password_email_requested", "update_password_form_submit"],
+  sign_up: ["button_click"],
+  auth: [
+    "reset_password_email_requested",
+    "update_password_form_submit",
+    "set_password_form_submit",
+  ],
   playground: [
     "execute_button_click",
     "save_to_new_prompt_button_click",
@@ -114,17 +131,21 @@ const events = {
     "delete_dashboard_form_open",
     "delete_dashboard_button_click",
   ],
+  monitors: ["delete_form_open", "delete_monitor_button_click"],
   datasets: [
     "delete_form_open",
     "delete_dataset_button_click",
     "update_form_open",
-    "delete_form_open",
     "new_form_open",
     "new_form_submit",
     "update_form_submit",
     "delete_form_submit",
   ],
-  organizations: ["new_form_submit", "new_form_open"],
+  organizations: [
+    "new_form_submit",
+    "new_form_open",
+    "demo_project_button_click",
+  ],
   projects: ["new_form_submit", "new_form_open"],
   dataset_item: [
     "archive_toggle",
@@ -150,13 +171,19 @@ const events = {
     "compare_run_removed",
   ],
   notification: ["click_link", "dismiss_notification"],
+  toast: ["report_issue", "dismiss"],
   tag: [
     "add_existing_tag",
     "remove_tag",
     "modal_open",
     "create_new_button_click",
   ],
-  onboarding: ["code_example_tab_switch", "tracing_check_active"],
+  onboarding: [
+    "code_example_tab_switch",
+    "tracing_check_active",
+    "tracing_agent_prompt_copy_clicked",
+    "tracing_manual_docs_link_clicked",
+  ],
   user_settings: ["theme_changed"],
   project_settings: [
     "project_delete",
@@ -182,11 +209,21 @@ const events = {
     "api_key_delete",
     "pricing_dialog_opened",
     "delete_organization",
+    "ai_features_toggle",
+    "ai_telemetry_toggle",
   ],
   help_popup: ["opened", "href_clicked"],
   navigate_detail_pages: ["button_click_prev_or_next"],
-  support_chat: ["initiated", "opened", "message_sent"], // also used on landing page for consistency
+  support_chat: [
+    "initiated",
+    "opened",
+    "message_sent",
+    "community_hours_click",
+  ], // also used on landing page for consistency
+  in_app_agent: ["new_chat_started", "new_chat_turn"],
   cmd_k_menu: ["opened", "search_entered", "navigated"],
+  spend_alert: ["created", "updated", "deleted"],
+  sidebar: ["book_a_call_clicked", "v4_beta_toggled"],
 } as const;
 
 // type that represents all possible event names, e.g. "traces:bookmark"

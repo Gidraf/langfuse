@@ -1,13 +1,14 @@
 import { type NestedObservation } from "@/src/utils/types";
-import { type TreeNode } from "./types";
+import { type TreeNode, type TraceSearchListItem } from "./types";
 import { type ObservationReturnType } from "@/src/server/api/routers/traces";
-import type { TraceSearchListItem } from "../TraceSearchList";
+import { formatIntervalSeconds } from "@/src/utils/dates";
 import Decimal from "decimal.js";
 import {
   type ObservationLevelType,
   ObservationLevel,
   type TraceDomain,
 } from "@langfuse/shared";
+import { type WithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 
 export function nestObservations(
   list: ObservationReturnType[],
@@ -27,10 +28,13 @@ export function nestObservations(
   );
   const hiddenObservationsCount = list.length - mutableList.length;
 
+  // Build a Set of all observation IDs for O(1) lookup instead of O(n) find
+  const observationIds = new Set(list.map((o) => o.id));
+
   mutableList.forEach((observation) => {
     if (
       observation.parentObservationId &&
-      !list.find((o) => o.id === observation.parentObservationId)
+      !observationIds.has(observation.parentObservationId)
     ) {
       observation.parentObservationId = null;
     }
@@ -181,6 +185,41 @@ export const heatMapTextColor = (p: {
   return "";
 };
 
+/**
+ * Decides whether a node's subtree wall-clock duration should be shown as a
+ * distinct badge alongside its own-span duration (LFE-10475), and returns that
+ * duration (ms) when it should.
+ *
+ * Async children can outlive their parent span, so a parent's own
+ * (endTime − startTime) can understate the real elapsed time of its subtree.
+ * The subtree always contains the own span, so it can only be ≥ own. We surface
+ * the badge on any difference that is visible at the rendered precision — i.e.
+ * when the subtree would display a different value than the own span. This shows
+ * every difference the user can actually see (down to the formatter's 0.01s
+ * resolution) while never rendering two identical-looking numbers. Users who
+ * don't want durations at all can hide them via the "show duration" toggle.
+ *
+ * A missing own-span duration is treated as 0 so that nodes without a recorded
+ * end still surface a meaningful subtree duration.
+ *
+ * @param ownDurationMs - the node's own span duration (endTime − startTime), ms
+ * @param subtreeWallClockDurationMs - max(end) − min(start) across the subtree, ms
+ */
+export function getSubtreeDurationOverflowMs(
+  ownDurationMs: number | undefined | null,
+  subtreeWallClockDurationMs: number | undefined | null,
+): number | null {
+  if (subtreeWallClockDurationMs == null) return null;
+  const own = ownDurationMs ?? 0;
+  if (subtreeWallClockDurationMs <= own) return null;
+  if (
+    formatIntervalSeconds(subtreeWallClockDurationMs / 1000) ===
+    formatIntervalSeconds(own / 1000)
+  )
+    return null;
+  return subtreeWallClockDurationMs;
+}
+
 // Helper function to unnest observations for cost calculation
 export const unnestObservation = (nestedObservation: NestedObservation) => {
   const unnestedObservations = [];
@@ -193,12 +232,75 @@ export const unnestObservation = (nestedObservation: NestedObservation) => {
 };
 
 // Transform trace + observations into unified tree structure
+// Helper function to compute and enrich tree nodes with pre-computed costs
+// This is done bottom-up: compute children first, then sum up to parent
+// Also populates the nodeMap for O(1) lookup by ID
+function enrichTreeNodeWithCosts(
+  node: TreeNode,
+  nodeMap: Map<string, TreeNode>,
+): TreeNode {
+  // First, recursively enrich all children
+  const enrichedChildren = node.children.map((child) =>
+    enrichTreeNodeWithCosts(child, nodeMap),
+  );
+
+  // Calculate this node's own cost
+  let nodeCost: Decimal | undefined;
+
+  if (node.calculatedTotalCost != null) {
+    const cost = new Decimal(node.calculatedTotalCost);
+    if (!cost.isZero()) {
+      nodeCost = cost;
+    }
+  } else if (
+    node.calculatedInputCost != null ||
+    node.calculatedOutputCost != null
+  ) {
+    const inputCost =
+      node.calculatedInputCost != null
+        ? new Decimal(node.calculatedInputCost)
+        : new Decimal(0);
+    const outputCost =
+      node.calculatedOutputCost != null
+        ? new Decimal(node.calculatedOutputCost)
+        : new Decimal(0);
+    const combinedCost = inputCost.plus(outputCost);
+    if (!combinedCost.isZero()) {
+      nodeCost = combinedCost;
+    }
+  }
+
+  // Sum up all children's total costs
+  const childrenTotalCost = enrichedChildren.reduce<Decimal | undefined>(
+    (acc, child) => {
+      if (!child.totalCost) return acc;
+      return acc ? acc.plus(child.totalCost) : child.totalCost;
+    },
+    undefined,
+  );
+
+  // Total cost = this node's cost + all children's costs
+  const totalCost =
+    nodeCost && childrenTotalCost
+      ? nodeCost.plus(childrenTotalCost)
+      : nodeCost || childrenTotalCost;
+
+  const enrichedNode = {
+    ...node,
+    children: enrichedChildren,
+    totalCost,
+  };
+
+  nodeMap.set(enrichedNode.id, enrichedNode);
+
+  return enrichedNode;
+}
+
 // This function is only used internally by buildTraceUiData
 function buildTraceTree(
-  trace: Omit<TraceDomain, "input" | "output" | "metadata"> & {
+  trace: Omit<WithStringifiedMetadata<TraceDomain>, "input" | "output"> & {
     input: string | null;
     output: string | null;
-    metadata: string | null;
     latency?: number;
   },
   observations: ObservationReturnType[],
@@ -206,6 +308,7 @@ function buildTraceTree(
 ): {
   tree: TreeNode;
   hiddenObservationsCount: number;
+  nodeMap: Map<string, TreeNode>;
 } {
   // First, nest the observations as before
   const { nestedObservations, hiddenObservationsCount } = nestObservations(
@@ -213,27 +316,76 @@ function buildTraceTree(
     minLevel,
   );
 
-  // Convert observations to TreeNodes
-  const convertObservationToTreeNode = (obs: NestedObservation): TreeNode => ({
-    id: obs.id,
-    type: obs.type,
-    name: obs.name ?? "",
-    startTime: obs.startTime,
-    endTime: obs.endTime,
-    level: obs.level,
-    children: obs.children.map(convertObservationToTreeNode),
-    inputUsage: obs.inputUsage,
-    outputUsage: obs.outputUsage,
-    totalUsage: obs.totalUsage,
-    calculatedInputCost:
-      "calculatedInputCost" in obs ? obs.calculatedInputCost : undefined,
-    calculatedOutputCost:
-      "calculatedOutputCost" in obs ? obs.calculatedOutputCost : undefined,
-    calculatedTotalCost:
-      "calculatedTotalCost" in obs ? obs.calculatedTotalCost : undefined,
-    parentObservationId: obs.parentObservationId,
-    traceId: obs.traceId,
-  });
+  // Create nodeMap for O(1) lookup by ID
+  const nodeMap = new Map<string, TreeNode>();
+
+  // Convert observations to TreeNodes with temporal and depth properties
+  const convertObservationToTreeNode = (
+    obs: NestedObservation,
+    traceStartTime: Date,
+    parentStartTime: Date | null,
+    depth: number,
+  ): TreeNode => {
+    const children = obs.children.map((child) =>
+      convertObservationToTreeNode(
+        child,
+        traceStartTime,
+        obs.startTime,
+        depth + 1,
+      ),
+    );
+
+    // Calculate childrenDepth (max depth of subtree rooted at this node)
+    const childrenDepth =
+      children.length > 0
+        ? Math.max(...children.map((c) => c.childrenDepth)) + 1
+        : 0;
+
+    return {
+      id: obs.id,
+      type: obs.type,
+      name: obs.name ?? "",
+      startTime: obs.startTime,
+      endTime: obs.endTime,
+      level: obs.level,
+      children,
+      inputUsage: obs.inputUsage,
+      outputUsage: obs.outputUsage,
+      totalUsage: obs.totalUsage,
+      calculatedInputCost: obs.inputCost,
+      calculatedOutputCost: obs.outputCost,
+      calculatedTotalCost: obs.totalCost,
+      parentObservationId: obs.parentObservationId,
+      traceId: obs.traceId,
+      startTimeSinceTrace: obs.startTime.getTime() - traceStartTime.getTime(),
+      startTimeSinceParentStart:
+        parentStartTime !== null
+          ? obs.startTime.getTime() - parentStartTime.getTime()
+          : null,
+      depth,
+      childrenDepth,
+    };
+  };
+
+  // Convert and enrich children with pre-computed costs and populate nodeMap
+  const enrichedChildren = nestedObservations
+    .map((obs) => convertObservationToTreeNode(obs, trace.timestamp, null, 0))
+    .map((node) => enrichTreeNodeWithCosts(node, nodeMap));
+
+  // Calculate total cost for trace root (sum of all top-level children)
+  const traceTotalCost = enrichedChildren.reduce<Decimal | undefined>(
+    (acc, child) => {
+      if (!child.totalCost) return acc;
+      return acc ? acc.plus(child.totalCost) : child.totalCost;
+    },
+    undefined,
+  );
+
+  // Calculate childrenDepth for trace root
+  const traceChildrenDepth =
+    enrichedChildren.length > 0
+      ? Math.max(...enrichedChildren.map((c) => c.childrenDepth)) + 1
+      : 0;
 
   // Create the root tree node (trace)
   // Use a unique ID for the trace root to avoid conflicts with observations that might have the same ID
@@ -243,20 +395,27 @@ function buildTraceTree(
     name: trace.name ?? "",
     startTime: trace.timestamp,
     endTime: null, // traces don't have explicit end times
-    children: nestedObservations.map(convertObservationToTreeNode),
+    children: enrichedChildren,
     latency: trace.latency,
+    totalCost: traceTotalCost,
+    startTimeSinceTrace: 0,
+    startTimeSinceParentStart: null,
+    depth: -1,
+    childrenDepth: traceChildrenDepth,
   };
 
-  return { tree, hiddenObservationsCount };
+  // Add trace root to nodeMap as well
+  nodeMap.set(tree.id, tree);
+
+  return { tree, hiddenObservationsCount, nodeMap };
 }
 
 // UI helper: build flat search items with per-node aggregated totals and root-level parent totals for heatmap scaling
 
 export function buildTraceUiData(
-  trace: Omit<TraceDomain, "input" | "output" | "metadata"> & {
+  trace: Omit<WithStringifiedMetadata<TraceDomain>, "input" | "output"> & {
     input: string | null;
     output: string | null;
-    metadata: string | null;
     latency?: number;
   },
   observations: ObservationReturnType[],
@@ -265,8 +424,9 @@ export function buildTraceUiData(
   tree: TreeNode;
   hiddenObservationsCount: number;
   searchItems: TraceSearchListItem[];
+  nodeMap: Map<string, TreeNode>;
 } {
-  const { tree, hiddenObservationsCount } = buildTraceTree(
+  const { tree, hiddenObservationsCount, nodeMap } = buildTraceTree(
     trace,
     observations,
     minLevel,
@@ -279,7 +439,10 @@ export function buildTraceUiData(
     let nodeCost: Decimal | undefined;
 
     if (node.calculatedTotalCost != null) {
-      nodeCost = new Decimal(node.calculatedTotalCost);
+      const cost = new Decimal(node.calculatedTotalCost);
+      if (!cost.isZero()) {
+        nodeCost = cost;
+      }
     } else if (
       node.calculatedInputCost != null ||
       node.calculatedOutputCost != null
@@ -340,5 +503,5 @@ export function buildTraceUiData(
   };
   visit(tree);
 
-  return { tree, hiddenObservationsCount, searchItems: out };
+  return { tree, hiddenObservationsCount, searchItems: out, nodeMap };
 }

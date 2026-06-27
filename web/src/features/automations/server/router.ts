@@ -1,6 +1,6 @@
 import { createTRPCRouter } from "@/src/server/api/trpc";
 import { protectedProjectProcedure } from "@/src/server/api/trpc";
-import { z } from "zod/v4";
+import { z } from "zod";
 import {
   ActionCreateSchema,
   ActionType,
@@ -9,6 +9,9 @@ import {
   isSafeWebhookActionConfig,
   isWebhookAction,
   convertToSafeWebhookConfig,
+  isGitHubDispatchAction,
+  convertToSafeGitHubDispatchConfig,
+  TriggerEventSourceSchema,
 } from "@langfuse/shared";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { v4 } from "uuid";
@@ -21,6 +24,7 @@ import {
 } from "@langfuse/shared/src/server";
 import { generateWebhookSecret, encrypt } from "@langfuse/shared/encryption";
 import { processWebhookActionConfig } from "./webhookHelpers";
+import { processGitHubDispatchActionConfig } from "./githubDispatchHelpers";
 import { TRPCError } from "@trpc/server";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 
@@ -136,7 +140,12 @@ export const automationsRouter = createTRPCRouter({
     }),
 
   getAutomations: protectedProjectProcedure
-    .input(z.object({ projectId: z.string() }))
+    .input(
+      z.object({
+        projectId: z.string(),
+        eventSource: TriggerEventSourceSchema.optional(),
+      }),
+    )
     .query(async ({ ctx, input }) => {
       // Check if user has at least read access to automations
       throwIfNoProjectAccess({
@@ -147,6 +156,7 @@ export const automationsRouter = createTRPCRouter({
 
       return await getAutomations({
         projectId: input.projectId,
+        eventSource: input.eventSource,
       });
     }),
 
@@ -277,6 +287,13 @@ export const automationsRouter = createTRPCRouter({
               "Slack integration not found. Please connect your Slack workspace first.",
           });
         }
+      } else if (input.actionType === "GITHUB_DISPATCH") {
+        const githubResult = await processGitHubDispatchActionConfig({
+          actionConfig: input.actionConfig,
+          projectId: input.projectId,
+        });
+        finalActionConfig = githubResult.finalActionConfig;
+        newUnencryptedWebhookSecret = githubResult.githubToken;
       }
 
       const [trigger, action, automation] = await ctx.prisma.$transaction(
@@ -336,7 +353,9 @@ export const automationsRouter = createTRPCRouter({
           ...action,
           config: isWebhookAction(action)
             ? convertToSafeWebhookConfig(action.config)
-            : action.config,
+            : isGitHubDispatchAction(action)
+              ? convertToSafeGitHubDispatchConfig(action.config)
+              : action.config,
         },
         trigger,
         automation,
@@ -388,6 +407,13 @@ export const automationsRouter = createTRPCRouter({
               "Slack integration not found. Please connect your Slack workspace first.",
           });
         }
+      } else if (input.actionType === "GITHUB_DISPATCH") {
+        const githubResult = await processGitHubDispatchActionConfig({
+          actionConfig: input.actionConfig,
+          actionId: existingAutomation.action.id,
+          projectId: input.projectId,
+        });
+        finalActionConfig = githubResult.finalActionConfig;
       }
 
       const [action, trigger, automation] = await ctx.prisma.$transaction(
@@ -462,7 +488,9 @@ export const automationsRouter = createTRPCRouter({
           ...action,
           config: isWebhookAction(action)
             ? convertToSafeWebhookConfig(action.config)
-            : action.config,
+            : isGitHubDispatchAction(action)
+              ? convertToSafeGitHubDispatchConfig(action.config)
+              : action.config,
         },
         trigger,
         automation,

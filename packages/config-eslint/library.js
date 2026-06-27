@@ -1,55 +1,65 @@
-const { resolve } = require("node:path");
+import js from "@eslint/js";
+import globals from "globals";
+import tseslint from "typescript-eslint";
+import sharedConfig from "./shared.js";
 
-const project = resolve(process.cwd(), "tsconfig.json");
+export default tseslint.config(
+  // Global ignores
+  {
+    name: "langfuse/ignores",
+    ignores: ["**/build/", "**/.next/", "**/.*"],
+  },
 
-/** @type {import("eslint").Linter.Config} */
-module.exports = {
-  extends: ["eslint:recommended", "prettier", "eslint-config-turbo"],
-  plugins: ["only-warn"],
-  globals: {
-    React: true,
-    JSX: true,
-  },
-  env: {
-    node: true,
-    es6: true,
-  },
-  settings: {
-    "import/resolver": {
-      typescript: {
-        project,
+  // Library JS rules (same as eslint v8 library.js)
+  js.configs.recommended,
+
+  ...sharedConfig,
+
+  // Global settings
+  {
+    name: "langfuse/library/globals",
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: {
+        ...globals.node,
+        ...globals.es2021,
+        React: "readonly",
+        JSX: "readonly",
       },
     },
-  },
-  ignorePatterns: [
-    // Ignore dotfiles
-    ".*.js",
-    "node_modules/",
-    "dist/",
-  ],
-  rules: {
-    "no-redeclare": "off",
-    "import/order": "off",
-  },
-  overrides: [
-    {
-      files: ["*.js?(x)", "*.ts?(x)"],
+    rules: {
+      "no-redeclare": "off",
+      "import/order": "off",
     },
-    {
-      files: ["*.ts", "*.mts", "*.cts", "*.tsx"],
-      // no-undef doesn't make sense in TS, see:
-      // https://typescript-eslint.io/troubleshooting/faqs/eslint/#i-get-errors-from-the-no-undef-rule-about-global-variables-not-being-defined-even-though-there-are-no-typescript-errors
-      rules: {
-        "no-undef": "off",
-        "no-restricted-globals": [
-          "error",
-          {
-            name: "redis",
-            message:
-              "Import redis explicitly from '@langfuse/shared/src/server' instead of using global.",
-          },
-        ],
+  },
+
+  // TypeScript-specific - parser only + custom rules
+  // Note: Old library.js had no TS rules, only eslint:recommended
+  // Adding parser + plugin to support custom rules, but not extending recommended
+  {
+    name: "langfuse/library/typescript",
+    files: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+    plugins: {
+      "@typescript-eslint": tseslint.plugin,
+    },
+    languageOptions: {
+      parser: tseslint.parser,
+      parserOptions: {
+        projectService: true,
       },
     },
-  ],
-};
+    rules: {
+      "no-undef": "off", // TypeScript handles this
+      "no-dupe-class-members": "off", // TypeScript handles this (and supports overloads)
+      "no-restricted-globals": [
+        "error",
+        {
+          name: "redis",
+          message: "Import redis explicitly from '@langfuse/shared/src/server'",
+        },
+      ],
+      "@typescript-eslint/no-deprecated": "warn",
+    },
+  },
+);

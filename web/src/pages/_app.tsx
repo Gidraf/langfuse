@@ -12,7 +12,7 @@ import NextAdapterPages from "next-query-params/pages";
 import { QueryParamProvider } from "use-query-params";
 
 import "@/src/styles/globals.css";
-import Layout from "@/src/components/layouts/layout";
+import { AppLayout } from "@/src/components/layouts/app-layout";
 import { useEffect, useRef } from "react";
 import { useRouter } from "next/router";
 
@@ -28,12 +28,58 @@ import "core-js/features/array/to-spliced";
 import "core-js/features/array/to-sorted";
 
 import "react18-json-view/src/style.css";
+import "streamdown/styles.css";
+
+// Polyfill to prevent React crashes when Google Translate modifies the DOM.
+// Google Translate wraps text nodes in <font> elements, which breaks React's
+// reconciliation when it tries to remove/insert nodes that no longer exist
+// in the expected location. This catches NotFoundError and prevents crashes
+// while still allowing translation to work.
+// See: https://github.com/facebook/react/issues/11538
+// See also: https://issues.chromium.org/issues/41407169
+if (typeof window !== "undefined") {
+  const originalRemoveChild = Element.prototype.removeChild;
+  const originalInsertBefore = Element.prototype.insertBefore;
+
+  Element.prototype.removeChild = function <T extends Node>(child: T): T {
+    try {
+      return originalRemoveChild.call(this, child) as T;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotFoundError") {
+        // Node was likely moved by Google Translate - silently ignore
+        return child;
+      }
+      throw error;
+    }
+  };
+
+  Element.prototype.insertBefore = function <T extends Node>(
+    newNode: T,
+    referenceNode: Node | null,
+  ): T {
+    try {
+      return originalInsertBefore.call(this, newNode, referenceNode) as T;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "NotFoundError") {
+        // Reference node was likely moved by Google Translate
+        // Fallback: append to end (DOM is already inconsistent anyway)
+        return this.appendChild(newNode) as T;
+      }
+      throw error;
+    }
+  };
+}
 
 import { DetailPageListsProvider } from "@/src/features/navigate-detail-pages/context";
 import { env } from "@/src/env.mjs";
 import { ThemeProvider } from "@/src/features/theming/ThemeProvider";
 import { MarkdownContextProvider } from "@/src/features/theming/useMarkdownContext";
 import { SupportDrawerProvider } from "@/src/features/support-chat/SupportDrawerProvider";
+import { InAppAiAgentProvider } from "@/src/ee/features/in-app-agent/components/InAppAiAgentProvider";
+import { useLangfuseCloudRegion } from "@/src/features/organizations/hooks";
+import { ScoreCacheProvider } from "@/src/features/scores/contexts/ScoreCacheContext";
+import { CorrectionCacheProvider } from "@/src/features/corrections/contexts/CorrectionCacheContext";
+import { V4_BETA_ENABLED_POSTHOG_PROPERTY } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
 // Check that PostHog is client-side (used to handle Next.js SSR) and that env vars are set
 if (
@@ -57,6 +103,7 @@ if (
     },
     autocapture: false,
     enable_heatmaps: false,
+    persistence: "cookie",
   });
 }
 
@@ -82,7 +129,10 @@ const MyApp: AppType<{ session: Session | null }> = ({
   }, []);
 
   return (
-    <QueryParamProvider adapter={NextAdapterPages}>
+    <QueryParamProvider
+      adapter={NextAdapterPages}
+      options={{ enableBatching: true }}
+    >
       <TooltipProvider>
         <CommandMenuProvider>
           <PostHogProvider client={posthog}>
@@ -99,13 +149,18 @@ const MyApp: AppType<{ session: Session | null }> = ({
                     enableSystem
                     disableTransitionOnChange
                   >
-                    <SupportDrawerProvider defaultOpen={false}>
-                      <Layout>
-                        <Component {...pageProps} />
-                        <UserTracking />
-                      </Layout>
-                    </SupportDrawerProvider>
-                    <BetterStackUptimeStatusMessage />
+                    <ScoreCacheProvider>
+                      <CorrectionCacheProvider>
+                        <SupportDrawerProvider defaultOpen={false}>
+                          <InAppAiAgentProvider defaultOpen={false}>
+                            <AppLayout>
+                              <Component {...pageProps} />
+                              <UserTracking />
+                            </AppLayout>
+                          </InAppAiAgentProvider>
+                        </SupportDrawerProvider>
+                      </CorrectionCacheProvider>
+                    </ScoreCacheProvider>
                   </ThemeProvider>
                 </MarkdownContextProvider>
               </DetailPageListsProvider>
@@ -121,6 +176,7 @@ export default api.withTRPC(MyApp);
 
 function UserTracking() {
   const session = useSession();
+  const { region } = useLangfuseCloudRegion();
   const sessionUser = session.data?.user;
 
   // Track user identity and properties
@@ -133,7 +189,7 @@ function UserTracking() {
     ) {
       lastIdentifiedUser.current = JSON.stringify(sessionUser);
       // PostHog
-      if (env.NEXT_PUBLIC_POSTHOG_KEY && env.NEXT_PUBLIC_POSTHOG_HOST)
+      if (env.NEXT_PUBLIC_POSTHOG_KEY && env.NEXT_PUBLIC_POSTHOG_HOST) {
         posthog.identify(sessionUser.id ?? undefined, {
           environment: process.env.NODE_ENV,
           email: sessionUser.email ?? undefined,
@@ -146,8 +202,15 @@ function UserTracking() {
                 organization: org,
               })),
             ) ?? undefined,
-          LANGFUSE_CLOUD_REGION: env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+          LANGFUSE_CLOUD_REGION: region,
+          [V4_BETA_ENABLED_POSTHOG_PROPERTY]:
+            sessionUser.v4BetaEnabled ?? false,
         });
+        posthog.register({
+          [V4_BETA_ENABLED_POSTHOG_PROPERTY]:
+            sessionUser.v4BetaEnabled ?? false,
+        });
+      }
 
       // Sentry
       setUser({
@@ -156,14 +219,11 @@ function UserTracking() {
       });
     } else if (session.status === "unauthenticated") {
       lastIdentifiedUser.current = null;
-      // PostHog
-      if (env.NEXT_PUBLIC_POSTHOG_KEY && env.NEXT_PUBLIC_POSTHOG_HOST) {
-        posthog.reset();
-      }
+      posthog.unregister(V4_BETA_ENABLED_POSTHOG_PROPERTY);
       // Sentry
       setUser(null);
     }
-  }, [sessionUser, session.status]);
+  }, [sessionUser, session.status, region]);
 
   // add stripe link to chat
   // const orgStripeLink = organization?.cloudConfig?.stripe?.customerId
@@ -191,16 +251,4 @@ if (
     console.log("Signal: ", signal);
     return await shutdown(signal);
   });
-}
-
-function BetterStackUptimeStatusMessage() {
-  if (!env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION) return null;
-  return (
-    <script
-      src="https://uptime.betterstack.com/widgets/announcement.js"
-      data-id="189328"
-      async={true}
-      type="text/javascript"
-    ></script>
-  );
 }

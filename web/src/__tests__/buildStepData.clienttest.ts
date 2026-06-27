@@ -1,5 +1,5 @@
 // No test dependencies from shared
-jest.mock("@langfuse/shared", () => ({
+vi.mock("@langfuse/shared", () => ({
   ObservationType: {
     SPAN: "SPAN",
     EVENT: "EVENT",
@@ -30,6 +30,47 @@ describe("buildStepData", () => {
     endTime: "2025-08-21 18:53:25.587",
     observationType: "AGENT",
     ...overrides,
+  });
+
+  describe("inverted time ranges", () => {
+    it("makes progress when a group contains inverted time ranges", () => {
+      const observations = [
+        createMockObservation({
+          id: "generation-1",
+          name: "generation-1",
+          startTime: "2026-05-27T09:17:52.469Z",
+          endTime: "2026-05-27T09:17:56.536Z",
+        }),
+        createMockObservation({
+          id: "generation-2",
+          name: "generation-2",
+          startTime: "2026-05-27T09:17:52.556Z",
+          endTime: "2026-05-27T09:17:57.301Z",
+        }),
+        createMockObservation({
+          id: "inverted-tool-1",
+          name: "inverted-tool-1",
+          startTime: "2026-05-27T09:17:55.846Z",
+          endTime: "2026-05-27T09:17:52.468Z",
+        }),
+        createMockObservation({
+          id: "inverted-tool-2",
+          name: "inverted-tool-2",
+          startTime: "2026-05-27T09:17:56.536Z",
+          endTime: "2026-05-27T09:17:52.556Z",
+        }),
+      ];
+      const result = buildStepData(observations);
+      const userObservations = result.filter((obs) => !obs.name.includes("__"));
+
+      expect(userObservations.map((obs) => obs.id)).toEqual([
+        "generation-1",
+        "generation-2",
+        "inverted-tool-1",
+        "inverted-tool-2",
+      ]);
+      expect(userObservations.every((obs) => obs.step !== null)).toBe(true);
+    });
   });
 
   describe("basic sequential timing", () => {
@@ -351,6 +392,92 @@ describe("buildStepData", () => {
   });
 
   describe("edge cases", () => {
+    it("should handle child starting before parent causing infinite loop (bug from trace 9f6079ff)", () => {
+      // child starts BEFORE parent, creating infinite loop, see LFE-7096
+      // The key is having multiple nested levels with same start times
+      const observations: AgentGraphDataResponse[] = [
+        createMockObservation({
+          id: "root",
+          name: "Root",
+          startTime: "2025-10-07 12:27:33.826",
+          endTime: "2025-10-07 12:27:33.829",
+          parentObservationId: null,
+        }),
+        createMockObservation({
+          id: "sibling1",
+          name: "Sibling1",
+          startTime: "2025-10-07 12:27:33.830",
+          endTime: "2025-10-07 12:27:33.830",
+          parentObservationId: "root",
+        }),
+        createMockObservation({
+          id: "sibling2",
+          name: "Sibling2",
+          startTime: "2025-10-07 12:27:33.830",
+          endTime: "2025-10-07 12:27:33.830",
+          parentObservationId: "root",
+        }),
+        createMockObservation({
+          id: "parent",
+          name: "Parent",
+          startTime: "2025-10-07 12:27:33.846", // Starts AFTER child
+          endTime: "2025-10-07 12:27:39.276",
+          parentObservationId: "root",
+        }),
+        createMockObservation({
+          id: "child",
+          name: "Child",
+          startTime: "2025-10-07 12:27:33.830", // Starts BEFORE parent!
+          endTime: "2025-10-07 12:27:39.274",
+          parentObservationId: "parent",
+        }),
+        createMockObservation({
+          id: "grandchild",
+          name: "Grandchild",
+          startTime: "2025-10-07 12:27:33.830",
+          endTime: "2025-10-07 12:27:36.437",
+          parentObservationId: "child",
+        }),
+        createMockObservation({
+          id: "ggchild1",
+          name: "GGChild1",
+          startTime: "2025-10-07 12:27:33.830",
+          endTime: "2025-10-07 12:27:33.830",
+          parentObservationId: "grandchild",
+        }),
+        createMockObservation({
+          id: "ggchild2",
+          name: "GGChild2",
+          startTime: "2025-10-07 12:27:33.830",
+          endTime: "2025-10-07 12:27:33.830",
+          parentObservationId: "grandchild",
+        }),
+        createMockObservation({
+          id: "gggchild",
+          name: "GGGChild",
+          startTime: "2025-10-07 12:27:33.866",
+          endTime: "2025-10-07 12:27:36.435",
+          parentObservationId: "grandchild",
+        }),
+        createMockObservation({
+          id: "ggggchild",
+          name: "GGGGChild",
+          startTime: "2025-10-07 12:27:33.866",
+          endTime: "2025-10-07 12:27:36.434",
+          parentObservationId: "gggchild",
+        }),
+      ];
+
+      const result = buildStepData(observations);
+
+      const userObservations = result.filter((obs) => !obs.name.includes("__"));
+      const parent = userObservations.find((o) => o.name === "Parent");
+      const child = userObservations.find((o) => o.name === "Child");
+
+      // Constraint must be enforced
+      expect(parent!.step!).toBeLessThan(child!.step!);
+    });
+
     it("should handle empty array", () => {
       const result = buildStepData([]);
       // Should only have system nodes (__start__, __end__)
@@ -358,54 +485,58 @@ describe("buildStepData", () => {
       expect(result.every((obs) => obs.name.includes("__"))).toBe(true);
     });
 
-    it("should handle large number of observations with identical timestamps just below limit", () => {
-      // This tests the edge case: create exactly 249 SPAN observations
-      // with complex timing patterns that could cause infinite recursion
+    it(
+      "should handle large number of observations with identical timestamps just below limit",
+      { timeout: 5000 },
+      () => {
+        // This tests the edge case: create exactly 249 SPAN observations
+        // with complex timing patterns that could cause infinite recursion
 
-      const observations: AgentGraphDataResponse[] = [];
-      const baseTime = new Date("2025-08-28T19:32:09.000Z").getTime();
+        const observations: AgentGraphDataResponse[] = [];
+        const baseTime = new Date("2025-08-28T19:32:09.000Z").getTime();
 
-      // Create exactly 249 SPAN observations to test the edge case just under the limit
-      for (let i = 0; i < 249; i++) {
-        // Create pathological timing patterns:
-        // - Many observations with identical start times
-        // - Zero duration observations
-        // - Complex parent-child relationships
-        const groupIndex = Math.floor(i / 20); // Group every 20 observations
-        const sameStartTime = baseTime + groupIndex * 100; // Same start time for each group
-        const zeroDuration = i % 3 === 0; // Every 3rd observation has zero duration
+        // Create exactly 249 SPAN observations to test the edge case just under the limit
+        for (let i = 0; i < 249; i++) {
+          // Create pathological timing patterns:
+          // - Many observations with identical start times
+          // - Zero duration observations
+          // - Complex parent-child relationships
+          const groupIndex = Math.floor(i / 20); // Group every 20 observations
+          const sameStartTime = baseTime + groupIndex * 100; // Same start time for each group
+          const zeroDuration = i % 3 === 0; // Every 3rd observation has zero duration
 
-        observations.push(
-          createMockObservation({
-            id: `span_${i.toString().padStart(3, "0")}`,
-            name: `complex_task_${i}`,
-            startTime: new Date(sameStartTime).toISOString(),
-            endTime: new Date(
-              sameStartTime + (zeroDuration ? 0 : 10 + (i % 5)),
-            ).toISOString(),
-            parentObservationId:
-              i === 0
-                ? null
-                : `span_${Math.max(0, i - 5)
-                    .toString()
-                    .padStart(3, "0")}`,
-            observationType: "SPAN", // All SPANs, no EVENTs to avoid filtering
-          }),
-        );
-      }
+          observations.push(
+            createMockObservation({
+              id: `span_${i.toString().padStart(3, "0")}`,
+              name: `complex_task_${i}`,
+              startTime: new Date(sameStartTime).toISOString(),
+              endTime: new Date(
+                sameStartTime + (zeroDuration ? 0 : 10 + (i % 5)),
+              ).toISOString(),
+              parentObservationId:
+                i === 0
+                  ? null
+                  : `span_${Math.max(0, i - 5)
+                      .toString()
+                      .padStart(3, "0")}`,
+              observationType: "SPAN", // All SPANs, no EVENTs to avoid filtering
+            }),
+          );
+        }
 
-      jest.setTimeout(5000); // 5 second timeout to catch infinite recursion
+        // 5 second timeout to catch infinite recursion is set via test options
 
-      expect(() => {
-        const result = buildStepData(observations);
+        expect(() => {
+          const result = buildStepData(observations);
 
-        // Should process successfully without infinite recursion
-        expect(result).toBeDefined();
-        expect(Array.isArray(result)).toBe(true);
-        // Should have more than 0 results since we're under the limit
-        expect(result.length).toBeGreaterThan(0);
-      }).not.toThrow();
-    });
+          // Should process successfully without infinite recursion
+          expect(result).toBeDefined();
+          expect(Array.isArray(result)).toBe(true);
+          // Should have more than 0 results since we're under the limit
+          expect(result.length).toBeGreaterThan(0);
+        }).not.toThrow();
+      },
+    );
 
     it("should handle single observation", () => {
       const observations: AgentGraphDataResponse[] = [

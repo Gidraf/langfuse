@@ -7,10 +7,18 @@ import {
   JobConfigState,
   isSlackActionConfig,
   isWebhookAction,
+  isGitHubDispatchAction,
+  type AutomationDomain,
+  type ActionDomainWithSecrets,
 } from "@langfuse/shared";
 import { decrypt, createSignatureHeader } from "@langfuse/shared/encryption";
-import { prisma } from "@langfuse/shared/src/db";
-import { validateWebhookURL } from "@langfuse/shared/src/server";
+import { Prisma, prisma } from "@langfuse/shared/src/db";
+import {
+  validateWebhookURL,
+  whitelistFromEnv,
+  fetchWithSecureRedirects,
+  WEBHOOK_URL_VALIDATION_LOG_CONTEXT,
+} from "@langfuse/shared/src/server";
 import {
   TQueueJobTypes,
   QueueName,
@@ -21,11 +29,87 @@ import {
   getConsecutiveAutomationFailures,
   SlackService,
   logger,
+  redis,
 } from "@langfuse/shared/src/server";
+import {
+  MonitorWebhookQueueEventSchema,
+  buildMonitorAlertSlackMessage,
+} from "@langfuse/shared/monitors/server";
 import { Processor, Job } from "bullmq";
 import { backOff } from "exponential-backoff";
 import { env } from "../env";
 import { SlackMessageBuilder } from "../features/slack/slackMessageBuilder";
+
+// GitHub repository_dispatch client_payload: max 10 top-level properties and <64KB.
+// https://docs.github.com/en/rest/repos/repos#create-a-repository-dispatch-event
+const GITHUB_REPOSITORY_DISPATCH_MAX_PAYLOAD_BYTES = 64 * 1024;
+const GITHUB_REPOSITORY_DISPATCH_TRUNCATION_MARKER =
+  "[TRUNCATED: GitHub repository_dispatch payload exceeded size limit]";
+const GITHUB_REPOSITORY_DISPATCH_TRUNCATED_FIELDS = [
+  "prompt.prompt",
+  "prompt.config",
+];
+
+/** automationFailureThreshold is the consecutive-failure count after which a monitor-alert trigger is auto-disabled. Mirrors prompt-version's getConsecutiveAutomationFailures threshold (>= 5 failures since the last success). */
+const automationFailureThreshold = 5;
+const automationFailureTtlSeconds = 24 * 60 * 60;
+const automationFailureKey = (projectId: string, automationId: string) =>
+  `automation-failures:${projectId}:${automationId}`;
+
+/** incrementAutomationFailure bumps the consecutive-failure counter for a monitor-alert Automation and refreshes the 24h TTL; returns the new count. Inline because monitor-alert is the only consumer today. */
+async function incrementAutomationFailure(args: {
+  projectId: string;
+  automationId: string;
+}): Promise<number> {
+  if (!redis) return 0;
+  const key = automationFailureKey(args.projectId, args.automationId);
+  const results = await redis
+    .multi()
+    .incr(key)
+    .expire(key, automationFailureTtlSeconds)
+    .exec();
+  return Number(results?.[0]?.[1] ?? 0);
+}
+
+/** resetAutomationFailures clears the streak after a successful delivery. */
+async function resetAutomationFailures(args: {
+  projectId: string;
+  automationId: string;
+}): Promise<void> {
+  if (!redis) return;
+  await redis.del(automationFailureKey(args.projectId, args.automationId));
+}
+
+/** buildWebhookOutboundPayload validates and returns the HTTP body for a WebhookInput, discriminating on payload.type. monitor-alert: the processor already built the unified envelope — pass through. prompt-version: wrap at dispatch time with id = executionId and timestamp = now. */
+function buildWebhookOutboundPayload(input: WebhookInput) {
+  if (input.payload.type === "monitor-alert") {
+    const parsed = MonitorWebhookQueueEventSchema.safeParse(input.payload);
+    if (!parsed.success) {
+      throw new InternalServerError(
+        `Invalid monitor-alert payload: ${parsed.error.message}`,
+      );
+    }
+    return parsed.data;
+  }
+  const promptPayload = input.payload;
+  const parsed = PromptWebhookOutboundSchema.safeParse({
+    id: input.executionId,
+    timestamp: new Date(),
+    type: promptPayload.type,
+    apiVersion: "v1",
+    action: promptPayload.action,
+    prompt: promptPayload.prompt,
+    user: promptPayload.user
+      ? { name: promptPayload.user.name, email: promptPayload.user.email }
+      : undefined,
+  });
+  if (!parsed.success) {
+    throw new InternalServerError(
+      `Invalid webhook payload: ${parsed.error.message}`,
+    );
+  }
+  return parsed.data;
+}
 
 // Handles both webhook and slack actions
 export const webhookProcessor: Processor = async (
@@ -73,6 +157,12 @@ export const executeWebhook = async (
         input,
         automation,
       });
+    } else if (automation.action.type === "GITHUB_DISPATCH") {
+      await executeGitHubDispatchAction({
+        input,
+        automation,
+        skipValidation: options?.skipValidation,
+      });
     } else {
       throw new InternalServerError(
         `Unsupported action type: ${automation.action.type}`,
@@ -89,99 +179,45 @@ export const executeWebhook = async (
 };
 
 /**
- * Execute webhook action with HTTP request and signature validation
+ * Shared HTTP execution logic for webhook and GitHub dispatch actions
+ * Handles: fetch with timeout, retry logic, status validation, execution tracking
  */
-async function executeWebhookAction({
-  input,
-  automation,
+async function executeHttpAction({
+  url,
+  payload,
+  headers,
+  projectId,
   skipValidation,
+  automation,
+  executionId,
+  executionStart,
+  actionConfig,
+  additionalSensitiveHeaders,
+  payloadType,
 }: {
-  input: WebhookInput;
-  automation: Awaited<ReturnType<typeof getAutomationById>>;
+  url: string;
+  payload: string;
+  headers: Record<string, string>;
+  projectId: string;
   skipValidation?: boolean;
-}) {
-  if (!automation) return;
-
-  const { projectId, executionId } = input;
-  const executionStart = new Date();
+  automation: AutomationDomain;
+  executionId: string;
+  executionStart: Date;
+  actionConfig: ActionDomainWithSecrets;
+  additionalSensitiveHeaders?: string[];
+  payloadType: WebhookInput["payload"]["type"];
+}): Promise<{ httpStatus: number; responseBody: string }> {
+  // monitor-alert does not write AutomationExecution rows; auto-disable rides a Redis counter instead.
+  const isMonitorAlert = payloadType === "monitor-alert";
   let httpStatus: number | undefined;
   let responseBody: string | undefined;
 
   try {
-    const actionConfig = await getActionByIdWithSecrets({
-      projectId,
-      actionId: automation.action.id,
-    });
-
-    if (!actionConfig) {
-      throw new InternalServerError("Action config not found");
-    }
-
-    if (!isWebhookAction(actionConfig)) {
-      throw new InternalServerError(
-        "Action config is not a valid webhook configuration",
-      );
-    }
-
-    const webhookConfig = actionConfig.config;
-
-    // Validate and prepare webhook payload
-    const validatedPayload = PromptWebhookOutboundSchema.safeParse({
-      id: input.executionId,
-      timestamp: new Date(),
-      type: input.payload.type,
-      apiVersion: "v1",
-      action: input.payload.action,
-      prompt: input.payload.prompt,
-    });
-
-    if (!validatedPayload.success) {
-      throw new InternalServerError(
-        `Invalid webhook payload: ${validatedPayload.error.message}`,
-      );
-    }
-
-    // Prepare webhook payload with prompt always last
-    const { prompt, ...otherFields } = validatedPayload.data;
-    const webhookPayload = JSON.stringify({
-      ...otherFields,
-      prompt,
-    });
-
-    // Prepare headers with signature if secret exists
-    const requestHeaders: Record<string, string> = {};
-
-    // Add webhook config headers first
-    if (webhookConfig.requestHeaders) {
-      for (const [key, value] of Object.entries(webhookConfig.requestHeaders)) {
-        requestHeaders[key] = value.value;
-      }
-    }
-
-    // Add default headers with precedence
-    for (const [key, value] of Object.entries(WebhookDefaultHeaders)) {
-      requestHeaders[key] = value;
-    }
-
-    try {
-      const decryptedSecret = decrypt(webhookConfig.secretKey);
-      const signature = createSignatureHeader(webhookPayload, decryptedSecret);
-      requestHeaders["x-langfuse-signature"] = signature;
-    } catch (error) {
-      logger.error(
-        "Failed to decrypt webhook secret or generate signature",
-        error,
-      );
-      throw new InternalServerError("Failed to generate webhook signature");
-    }
-
-    // Execute webhook with retries
+    // Execute HTTP request with retries
     await backOff(
       async () => {
-        logger.debug(
-          `Sending webhook to ${webhookConfig.url} with payload ${JSON.stringify(
-            webhookPayload,
-          )} and headers ${JSON.stringify(requestHeaders)}`,
+        logger.info(
+          `Sending HTTP request to ${url} for action ${automation.action.id}`,
         );
 
         // Create AbortController for timeout
@@ -191,36 +227,71 @@ async function executeWebhookAction({
         }, env.LANGFUSE_WEBHOOK_TIMEOUT_MS);
 
         try {
+          const whitelist = whitelistFromEnv();
+
           // Skip validation when flag is set (for tests with MSW mocking)
           if (!skipValidation) {
-            await validateWebhookURL(webhookConfig.url);
+            await validateWebhookURL(url, whitelist);
           }
 
-          const res = await fetch(webhookConfig.url, {
-            method: "POST",
-            body: webhookPayload,
-            headers: requestHeaders,
-            signal: abortController.signal,
-          });
+          const redirectOptions = skipValidation
+            ? {
+                maxRedirects: env.LANGFUSE_WEBHOOK_MAX_REDIRECTS,
+                skipValidation: true as const,
+                additionalSensitiveHeaders,
+              }
+            : {
+                maxRedirects: env.LANGFUSE_WEBHOOK_MAX_REDIRECTS,
+                redirectValidation: {
+                  validateUrl: validateWebhookURL,
+                  whitelist,
+                  logContext: WEBHOOK_URL_VALIDATION_LOG_CONTEXT,
+                },
+                additionalSensitiveHeaders,
+              };
+
+          const redirectResult = await fetchWithSecureRedirects(
+            url,
+            {
+              method: "POST",
+              body: payload,
+              headers,
+              signal: abortController.signal,
+            },
+            redirectOptions,
+          );
+
+          const res = redirectResult.response;
+
+          // Log redirect chain if any redirects occurred (security audit trail)
+          if (redirectResult.redirectChain.length > 0) {
+            logger.info("Webhook followed redirects", {
+              actionId: automation.action.id,
+              initialUrl: url,
+              finalUrl: redirectResult.finalUrl,
+              redirectCount: redirectResult.redirectChain.length,
+              redirectChain: redirectResult.redirectChain,
+            });
+          }
 
           httpStatus = res.status;
           responseBody = await res.text();
 
-          if (res.status !== 200) {
+          if (!res.ok) {
             logger.warn(
-              `Webhook does not return 200: failed with status ${res.status} for url ${webhookConfig.url} and project ${projectId}. Body: ${responseBody}`,
+              `Webhook does not return 2xx status: failed with status ${res.status} for url ${url} and project ${projectId}. Body: ${responseBody}`,
             );
             throw new Error(
-              `Webhook does not return 200: failed with status ${res.status} for url ${webhookConfig.url} and project ${projectId}`,
+              `Webhook does not return 2xx status: failed with status ${res.status} for url ${url} and project ${projectId}`,
             );
           }
         } catch (error) {
           if (error instanceof Error && error.name === "AbortError") {
             logger.warn(
-              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${webhookConfig.url} and project ${projectId}`,
+              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${url} and project ${projectId}`,
             );
             throw new Error(
-              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${webhookConfig.url} and project ${projectId}`,
+              `Webhook timeout after ${env.LANGFUSE_WEBHOOK_TIMEOUT_MS}ms for url ${url} and project ${projectId}`,
             );
           }
           throw error;
@@ -234,41 +305,81 @@ async function executeWebhookAction({
     );
 
     // Update execution status on success
-    await prisma.automationExecution.update({
-      where: {
-        projectId,
-        triggerId: automation.trigger.id,
-        actionId: automation.action.id,
-        id: executionId,
-      },
-      data: {
-        status: ActionExecutionStatus.COMPLETED,
-        startedAt: executionStart,
-        finishedAt: new Date(),
-      },
-    });
-  } catch (error) {
-    logger.error("Error executing webhook action", error);
+    if (isMonitorAlert) {
+      try {
+        await resetAutomationFailures({
+          projectId,
+          automationId: automation.id,
+        });
+      } catch (resetError) {
+        logger.warn(
+          `Failed to reset automation failure counter after successful delivery for automation ${automation.id} in project ${projectId}`,
+          resetError,
+        );
+      }
+    } else {
+      await prisma.automationExecution.update({
+        where: {
+          projectId,
+          triggerId: automation.trigger.id,
+          actionId: automation.action.id,
+          id: executionId,
+        },
+        data: {
+          status: ActionExecutionStatus.COMPLETED,
+          startedAt: executionStart,
+          finishedAt: new Date(),
+        },
+      });
+    }
 
-    // Handle webhook action failure with retry logic and trigger disabling
+    return { httpStatus: httpStatus!, responseBody: responseBody! };
+  } catch (error) {
+    logger.error("Error executing HTTP action", error);
+
+    // Handle action failure with retry logic and trigger disabling
     const shouldRetryJob =
       error instanceof LangfuseNotFoundError ||
       error instanceof InternalServerError;
 
     if (shouldRetryJob) {
-      logger.warn(`Retrying BullMQ for webhook action ${automation.action.id}`);
+      logger.warn(`Retrying BullMQ for action ${automation.action.id}`);
       throw error; // Trigger BullMQ retry
     }
 
-    // Get action config for updating in case of failure
-    const failureActionConfig = await getActionByIdWithSecrets({
-      projectId,
-      actionId: automation.action.id,
-    });
-
-    if (!failureActionConfig) {
+    if (!actionConfig) {
       logger.error("Action config not found for failure handling");
-      return;
+      throw error;
+    }
+
+    if (isMonitorAlert) {
+      // monitor-alert: Redis counter compensates for the missing
+      // AutomationExecution streak. Disable on the 5th consecutive failure.
+      const count = await incrementAutomationFailure({
+        projectId,
+        automationId: automation.id,
+      });
+      if (count >= automationFailureThreshold) {
+        await prisma.trigger.update({
+          where: { id: automation.trigger.id, projectId },
+          data: { status: JobConfigState.INACTIVE },
+        });
+        try {
+          await resetAutomationFailures({
+            projectId,
+            automationId: automation.id,
+          });
+        } catch (resetError) {
+          logger.warn(
+            `Failed to reset automation failure counter after auto-disable for automation ${automation.id} in project ${projectId}`,
+            resetError,
+          );
+        }
+        logger.warn(
+          `Automation ${automation.trigger.id} disabled after ${count} consecutive failures in project ${projectId} (monitor-alert)`,
+        );
+      }
+      return { httpStatus: httpStatus || 0, responseBody: responseBody || "" };
     }
 
     // Update execution status and check if we should disable trigger
@@ -314,15 +425,18 @@ async function executeWebhookAction({
         });
 
         // Update action config to store the failing execution ID
-        await tx.action.update({
-          where: { id: automation.action.id, projectId },
-          data: {
-            config: {
-              ...failureActionConfig.config,
-              lastFailingExecutionId: executionId,
-            },
-          },
-        });
+        // Type guard to ensure we only update webhook or GitHub dispatch configs
+        if (
+          isWebhookAction(actionConfig) ||
+          isGitHubDispatchAction(actionConfig)
+        ) {
+          await setActionLastFailingExecutionId({
+            tx,
+            actionId: automation.action.id,
+            projectId,
+            executionId,
+          });
+        }
 
         logger.warn(
           `Automation ${automation.trigger.id} disabled after ${consecutiveFailures} consecutive failures in project ${projectId}`,
@@ -331,9 +445,253 @@ async function executeWebhookAction({
     });
 
     logger.debug(
-      `Webhook action failed for action ${automation.action.id} in project ${projectId}`,
+      `HTTP action failed for action ${automation.action.id} in project ${projectId}`,
+    );
+
+    // Error has been handled - don't rethrow
+    // Return empty response to indicate failure was handled
+    return { httpStatus: httpStatus || 0, responseBody: responseBody || "" };
+  }
+}
+
+/**
+ * Execute webhook action with HTTP request and signature validation
+ */
+async function executeWebhookAction({
+  input,
+  automation,
+  skipValidation,
+}: {
+  input: WebhookInput;
+  automation: Awaited<ReturnType<typeof getAutomationById>>;
+  skipValidation?: boolean;
+}) {
+  if (!automation) return;
+
+  const { projectId, executionId } = input;
+  const executionStart = new Date();
+
+  const actionConfig = await getActionByIdWithSecrets({
+    projectId,
+    actionId: automation.action.id,
+  });
+
+  if (!actionConfig) {
+    throw new InternalServerError("Action config not found");
+  }
+
+  if (!isWebhookAction(actionConfig)) {
+    throw new InternalServerError(
+      "Action config is not a valid webhook configuration",
     );
   }
+
+  const webhookConfig = actionConfig.config;
+
+  const validated = buildWebhookOutboundPayload(input);
+  let webhookPayload: string;
+  if (input.payload.type === "prompt-version") {
+    // Prompt-version contract: prompt key always last.
+    const { prompt, user, ...otherFields } = validated as Extract<
+      typeof validated,
+      { type: "prompt-version" }
+    >;
+    webhookPayload = JSON.stringify({
+      ...otherFields,
+      ...(user ? { user } : {}),
+      prompt,
+    });
+  } else {
+    // monitor-alert: post the envelope verbatim.
+    webhookPayload = JSON.stringify(validated);
+  }
+
+  // Prepare headers with signature if secret exists
+  const requestHeaders: Record<string, string> = {};
+  const additionalSensitiveHeaders: string[] = [];
+
+  // Add webhook config headers first
+  if (webhookConfig.requestHeaders) {
+    for (const [key, value] of Object.entries(webhookConfig.requestHeaders)) {
+      requestHeaders[key] = value.value;
+      if (value.secret) {
+        additionalSensitiveHeaders.push(key);
+      }
+    }
+  }
+
+  // Add default headers with precedence
+  for (const [key, value] of Object.entries(WebhookDefaultHeaders)) {
+    requestHeaders[key] = value;
+  }
+
+  try {
+    const decryptedSecret = decrypt(webhookConfig.secretKey);
+    const signature = createSignatureHeader(webhookPayload, decryptedSecret);
+    requestHeaders["x-langfuse-signature"] = signature;
+  } catch (error) {
+    logger.error(
+      "Failed to decrypt webhook secret or generate signature",
+      error,
+    );
+    throw new InternalServerError("Failed to generate webhook signature");
+  }
+
+  // Execute HTTP request using shared function
+  await executeHttpAction({
+    url: webhookConfig.url,
+    payload: webhookPayload,
+    headers: requestHeaders,
+    projectId,
+    skipValidation,
+    automation,
+    executionId,
+    executionStart,
+    actionConfig,
+    additionalSensitiveHeaders,
+    payloadType: input.payload.type,
+  });
+}
+
+/**
+ * Execute GitHub Dispatch action with repository dispatch API
+ */
+async function executeGitHubDispatchAction({
+  input,
+  automation,
+  skipValidation,
+}: {
+  input: WebhookInput;
+  automation: Awaited<ReturnType<typeof getAutomationById>>;
+  skipValidation?: boolean;
+}) {
+  if (!automation) return;
+
+  const { projectId, executionId } = input;
+  const executionStart = new Date();
+
+  const actionConfig = await getActionByIdWithSecrets({
+    projectId,
+    actionId: automation.action.id,
+  });
+
+  if (!actionConfig) {
+    throw new InternalServerError("Action config not found");
+  }
+
+  if (!isGitHubDispatchAction(actionConfig)) {
+    throw new InternalServerError(
+      "Action config is not a valid GitHub dispatch configuration",
+    );
+  }
+
+  const githubConfig = actionConfig.config;
+  const eventType = githubConfig.eventType;
+  const validated = buildWebhookOutboundPayload(input);
+
+  let githubPayload: string;
+  if (input.payload.type === "prompt-version") {
+    const { prompt, user, ...otherFields } = validated as Extract<
+      typeof validated,
+      { type: "prompt-version" }
+    >;
+    const fullGithubPayload = JSON.stringify({
+      event_type: eventType,
+      client_payload: {
+        ...otherFields,
+        ...(user ? { user } : {}),
+        prompt,
+      },
+    });
+    githubPayload =
+      Buffer.byteLength(fullGithubPayload, "utf8") <
+      GITHUB_REPOSITORY_DISPATCH_MAX_PAYLOAD_BYTES
+        ? fullGithubPayload
+        : JSON.stringify({
+            event_type: eventType,
+            client_payload: {
+              ...otherFields,
+              ...(user ? { user } : {}),
+              truncation: {
+                payloadTruncated: true,
+                truncatedFields: GITHUB_REPOSITORY_DISPATCH_TRUNCATED_FIELDS,
+              },
+              prompt: {
+                ...prompt,
+                prompt: GITHUB_REPOSITORY_DISPATCH_TRUNCATION_MARKER,
+                config: {},
+              },
+            },
+          });
+  } else {
+    // monitor-alert: post the envelope as client_payload.
+    const monitorEnvelope = validated as Extract<
+      typeof validated,
+      { type: "monitor-alert" }
+    >;
+    const fullGithubPayload = JSON.stringify({
+      event_type: eventType,
+      client_payload: monitorEnvelope,
+    });
+    githubPayload =
+      Buffer.byteLength(fullGithubPayload, "utf8") <
+      GITHUB_REPOSITORY_DISPATCH_MAX_PAYLOAD_BYTES
+        ? fullGithubPayload
+        : JSON.stringify({
+            event_type: eventType,
+            client_payload: {
+              ...monitorEnvelope,
+              payload: {
+                ...monitorEnvelope.payload,
+                filters: [],
+                message: {
+                  ...monitorEnvelope.payload.message,
+                  body: GITHUB_REPOSITORY_DISPATCH_TRUNCATION_MARKER,
+                },
+              },
+              truncation: {
+                payloadTruncated: true,
+                truncatedFields: ["payload.filters", "payload.message.body"],
+              },
+            },
+          });
+  }
+
+  // Prepare headers with GitHub token
+  const requestHeaders: Record<string, string> = {};
+
+  // Add default headers
+  for (const [key, value] of Object.entries(WebhookDefaultHeaders)) {
+    requestHeaders[key] = value;
+  }
+
+  try {
+    const decryptedToken = decrypt(githubConfig.githubToken);
+
+    // Add GitHub token as Bearer auth
+    requestHeaders["Authorization"] = `Bearer ${decryptedToken}`;
+
+    // Add signature for optional verification (using GitHub token as secret)
+    const signature = createSignatureHeader(githubPayload, decryptedToken);
+    requestHeaders["x-langfuse-signature"] = signature;
+  } catch (error) {
+    logger.error("Failed to decrypt GitHub token or generate signature", error);
+    throw new InternalServerError("Failed to generate GitHub authentication");
+  }
+
+  // Execute HTTP request using shared function
+  await executeHttpAction({
+    url: githubConfig.url,
+    payload: githubPayload,
+    headers: requestHeaders,
+    projectId,
+    skipValidation,
+    automation,
+    executionId,
+    executionStart,
+    actionConfig,
+    payloadType: input.payload.type,
+  });
 }
 
 /**
@@ -351,26 +709,46 @@ async function executeSlackAction({
   const { projectId, executionId } = input;
   const executionStart = new Date();
 
+  const actionConfig = await getActionById({
+    projectId,
+    actionId: automation.action.id,
+  });
+
+  if (!actionConfig) {
+    throw new InternalServerError("Action config not found");
+  }
+
+  if (!isSlackActionConfig(actionConfig.config)) {
+    throw new InternalServerError(
+      "Action config is not a valid Slack configuration",
+    );
+  }
+
+  const slackConfig = actionConfig.config;
+
+  // TODO: unify automation execution log and failure handling across all message types (not scalable yet)
+  // TODO: implement a strategy/policy + registry pattern for different webhook providers.
+  if (input.payload.type === "monitor-alert") {
+    try {
+      await sendSlackMonitorAlert({
+        payload: input.payload,
+        projectId,
+        channelId: slackConfig.channelId,
+        automationId: automation.id,
+      });
+    } catch (error) {
+      logger.error("Error executing Slack action", error);
+      await slackMonitorAlertFailure({ projectId, automation });
+    }
+    return;
+  }
+
   try {
-    const actionConfig = await getActionById({
-      projectId,
-      actionId: automation.action.id,
-    });
-
-    if (!actionConfig) {
-      throw new InternalServerError("Action config not found");
-    }
-
-    if (!isSlackActionConfig(actionConfig.config)) {
-      throw new InternalServerError(
-        "Action config is not a valid Slack configuration",
-      );
-    }
-
-    const slackConfig = actionConfig.config;
-
     // Build message blocks using predefined formats or custom template
     let blocks: any[] = [];
+    let attachments:
+      | { color: string; fallback?: string; blocks?: any[] }[]
+      | undefined;
 
     // TODO: Custom templates not supported via the UI yet
     if (slackConfig.messageTemplate) {
@@ -389,7 +767,9 @@ async function executeSlackAction({
 
     // Use predefined message format if no custom template or template failed
     if (blocks.length === 0) {
-      blocks = SlackMessageBuilder.buildMessage(input.payload);
+      const message = SlackMessageBuilder.buildMessage(input.payload);
+      blocks = message.blocks;
+      attachments = message.attachments;
       logger.debug(
         `Using predefined message format for action ${automation.action.id}`,
       );
@@ -404,6 +784,7 @@ async function executeSlackAction({
       client,
       channelId: slackConfig.channelId,
       blocks,
+      attachments,
       text: "Langfuse Notification",
     });
 
@@ -464,14 +845,11 @@ async function executeSlackAction({
       });
 
       // Update action config to store the failing execution ID
-      await tx.action.update({
-        where: { id: automation.action.id, projectId },
-        data: {
-          config: {
-            ...failureActionConfig.config,
-            lastFailingExecutionId: executionId,
-          },
-        },
+      await setActionLastFailingExecutionId({
+        tx,
+        actionId: automation.action.id,
+        projectId,
+        executionId,
       });
 
       logger.warn(
@@ -484,3 +862,84 @@ async function executeSlackAction({
     );
   }
 }
+
+/** sendSlackMonitorAlert builds and posts a monitor-alert to Slack, then clears the failure streak. */
+async function sendSlackMonitorAlert({
+  payload,
+  projectId,
+  channelId,
+  automationId,
+}: {
+  payload: WebhookInput["payload"];
+  projectId: string;
+  channelId: string;
+  automationId: string;
+}) {
+  const parsed = MonitorWebhookQueueEventSchema.safeParse(payload);
+  if (!parsed.success) {
+    throw new InternalServerError(
+      `Invalid monitor-alert payload: ${parsed.error.message}`,
+    );
+  }
+  const message = buildMonitorAlertSlackMessage(parsed.data.payload);
+  const client =
+    await SlackService.getInstance().getWebClientForProject(projectId);
+  await SlackService.getInstance().sendMessage({
+    client,
+    channelId,
+    ...message,
+  });
+  await resetAutomationFailures({ projectId, automationId });
+}
+
+/** slackMonitorAlertFailure tracks a failed monitor-alert delivery and auto-disables the trigger past the failure threshold. */
+async function slackMonitorAlertFailure({
+  projectId,
+  automation,
+}: {
+  projectId: string;
+  automation: NonNullable<Awaited<ReturnType<typeof getAutomationById>>>;
+}) {
+  const count = await incrementAutomationFailure({
+    projectId,
+    automationId: automation.id,
+  });
+  if (count >= automationFailureThreshold) {
+    await prisma.trigger.update({
+      where: { id: automation.trigger.id, projectId },
+      data: { status: JobConfigState.INACTIVE },
+    });
+    await resetAutomationFailures({ projectId, automationId: automation.id });
+    logger.warn(
+      `Automation ${automation.trigger.id} disabled after ${count} consecutive failures in project ${projectId} (monitor-alert/slack)`,
+    );
+  }
+}
+
+const setActionLastFailingExecutionId = async ({
+  tx,
+  actionId,
+  projectId,
+  executionId,
+}: {
+  tx: Prisma.TransactionClient;
+  actionId: string;
+  projectId: string;
+  executionId: string;
+}) => {
+  // The execution config may contain decrypted headers, so patch only this JSON
+  // key and leave the stored encrypted config untouched.
+  await tx.$executeRaw`
+    UPDATE actions
+    SET
+      config = jsonb_set(
+        config,
+        '{lastFailingExecutionId}',
+        to_jsonb(${executionId}::text),
+        true
+      ),
+      updated_at = NOW()
+    WHERE id = ${actionId}
+      AND project_id = ${projectId}
+  `;
+};

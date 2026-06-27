@@ -1,7 +1,8 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { aggregateScores } from "@/src/features/scores/lib/aggregateScores";
+import { applyCommentFilters } from "@langfuse/shared/src/server";
 import {
   createTRPCRouter,
   protectedGetTraceProcedure,
@@ -9,15 +10,22 @@ import {
 } from "@/src/server/api/trpc";
 import {
   BatchActionQuerySchema,
+  BatchTableNames,
   BatchExportTableName,
   BatchActionType,
+  ActionId,
   filterAndValidateDbScoreList,
+  normalizeOrderByForTable,
   orderBy,
   paginationZod,
   singleFilter,
   timeFilter,
   type Observation,
   TracingSearchType,
+  type ScoreDomain,
+  ScoreDataTypeArray,
+  ScoreDataTypeEnum,
+  LISTABLE_SCORE_TYPES,
 } from "@langfuse/shared";
 import {
   traceException,
@@ -39,21 +47,35 @@ import {
   convertDateToClickhouseDateTime,
   getAgentGraphData,
   tracesTableUiColumnDefinitions,
+  getTracesGroupedByUsers,
+  getTracesGroupedBySessionId,
+  updateEvents,
+  getScoresAndCorrectionsForTraces,
 } from "@langfuse/shared/src/server";
 import { TRPCError } from "@trpc/server";
 import { createBatchActionJob } from "@/src/features/table/server/createBatchActionJob";
 import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
+import { sanitizeLegacyTracingSearch } from "@/src/features/traces/server/legacyIoSearch";
 import {
   type AgentGraphDataResponse,
   AgentGraphDataSchema,
 } from "@/src/features/trace-graph-view/types";
+import { env } from "@/src/env.mjs";
+import {
+  toDomainWithStringifiedMetadata,
+  toDomainArrayWithStringifiedMetadata,
+} from "@/src/utils/clientSideDomainTypes";
+import { scoreFilters } from "@/src/features/scores/lib/scoreColumns";
+import partition from "lodash/partition";
 
-const TraceFilterOptions = z.object({
+const TraceCountOptions = z.object({
   projectId: z.string(), // Required for protectedProjectProcedure
   searchQuery: z.string().nullable(),
   searchType: z.array(TracingSearchType),
   filter: z.array(singleFilter).nullable(),
   orderBy: orderBy,
+});
+const TraceFilterOptions = TraceCountOptions.extend({
   ...paginationZod,
 });
 type TraceFilterOptions = z.infer<typeof TraceFilterOptions>;
@@ -64,6 +86,11 @@ export type ObservationReturnTypeWithMetadata = Omit<
 > & {
   traceId: string;
   metadata: string | null;
+  traceName?: string | null;
+  traceTags?: string[];
+  // optional, because in v4 an observation can have those properties
+  userId?: string | null;
+  sessionId?: string | null;
 };
 
 export type ObservationReturnType = Omit<
@@ -72,37 +99,92 @@ export type ObservationReturnType = Omit<
 >;
 
 export const traceRouter = createTRPCRouter({
-  hasAny: protectedProjectProcedure
+  hasTracingConfigured: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
       }),
     )
-    .query(async ({ input }) => {
-      return hasAnyTrace(input.projectId);
+    .query(async ({ input, ctx }) => {
+      // Check if there are any traces in the database
+      const hasTraces = await hasAnyTrace(input.projectId);
+
+      if (hasTraces) {
+        return true;
+      }
+
+      // If no traces, check if data retention is configured
+      // This indicates the user has configured tracing even if data retention cleaned all traces
+      const project = await ctx.prisma.project.findUnique({
+        where: {
+          id: input.projectId,
+        },
+        select: {
+          retentionDays: true,
+        },
+      });
+
+      return !!(project?.retentionDays && project.retentionDays > 0);
     }),
   all: protectedProjectProcedure
     .input(TraceFilterOptions)
     .query(async ({ input, ctx }) => {
+      const search = sanitizeLegacyTracingSearch({
+        searchQuery: input.searchQuery,
+        searchType: input.searchType,
+        tableName: BatchTableNames.Traces,
+      });
+
+      const { filterState, hasNoMatches } = await applyCommentFilters({
+        filterState: input.filter ?? [],
+        prisma: ctx.prisma,
+        projectId: ctx.session.projectId,
+        objectType: "TRACE",
+      });
+
+      if (hasNoMatches) {
+        return { traces: [] };
+      }
+
       const traces = await getTracesTable({
         projectId: ctx.session.projectId,
-        filter: input.filter ?? [],
-        searchQuery: input.searchQuery ?? undefined,
-        searchType: input.searchType ?? ["id"],
-        orderBy: input.orderBy,
+        filter: filterState,
+        searchQuery: search.searchQuery,
+        searchType: search.searchType ?? ["id"],
+        orderBy: normalizeOrderByForTable({
+          orderBy: input.orderBy,
+          expectedTimeColumn: "timestamp",
+        }),
         limit: input.limit,
         page: input.page,
       });
       return { traces };
     }),
   countAll: protectedProjectProcedure
-    .input(TraceFilterOptions)
+    .input(TraceCountOptions)
     .query(async ({ input, ctx }) => {
+      const search = sanitizeLegacyTracingSearch({
+        searchQuery: input.searchQuery,
+        searchType: input.searchType,
+        tableName: BatchTableNames.Traces,
+      });
+
+      const { filterState, hasNoMatches } = await applyCommentFilters({
+        filterState: input.filter ?? [],
+        prisma: ctx.prisma,
+        projectId: ctx.session.projectId,
+        objectType: "TRACE",
+      });
+
+      if (hasNoMatches) {
+        return { totalCount: 0 };
+      }
+
       const count = await getTracesTableCount({
         projectId: ctx.session.projectId,
-        filter: input.filter ?? [],
-        searchType: input.searchType,
-        searchQuery: input.searchQuery ?? undefined,
+        filter: filterState,
+        searchType: search.searchType ?? ["id"],
+        searchQuery: search.searchQuery,
         limit: 1,
         page: 0,
       });
@@ -121,20 +203,56 @@ export const traceRouter = createTRPCRouter({
     )
     .query(async ({ input, ctx }) => {
       if (input.traceIds.length === 0) return [];
+
+      const { filterState, hasNoMatches, matchingIds } =
+        await applyCommentFilters({
+          filterState: input.filter ?? [],
+          prisma: ctx.prisma,
+          projectId: ctx.session.projectId,
+          objectType: "TRACE",
+        });
+
+      if (hasNoMatches) {
+        return [];
+      }
+
+      // If comment filters returned matching IDs, intersect with input.traceIds
+      let filteredTraceIds = input.traceIds;
+      if (matchingIds !== null) {
+        filteredTraceIds = input.traceIds.filter((id) =>
+          matchingIds.includes(id),
+        );
+
+        if (filteredTraceIds.length === 0) {
+          return [];
+        }
+      }
+
+      // Remove the comment filter's ID injection and use filteredTraceIds instead
+      const filterWithoutCommentIds = filterState.filter(
+        (f) =>
+          !(
+            f.type === "stringOptions" &&
+            f.column === "id" &&
+            f.operator === "any of"
+          ),
+      );
+
       const res = await getTracesTableMetrics({
         projectId: ctx.session.projectId,
         filter: [
-          ...(input.filter ?? []),
+          ...filterWithoutCommentIds,
           {
             type: "stringOptions",
             operator: "any of",
             column: "ID",
-            value: input.traceIds,
+            value: filteredTraceIds,
           },
         ],
+        orderBy: { column: "timestamp", order: "DESC" },
       });
 
-      const scores = await getScoresForTraces({
+      const traceScores = await getScoresForTraces({
         projectId: ctx.session.projectId,
         traceIds: res.map((r) => r.id),
         limit: 1000,
@@ -144,7 +262,8 @@ export const traceRouter = createTRPCRouter({
       });
 
       const validatedScores = filterAndValidateDbScoreList({
-        scores,
+        scores: traceScores,
+        dataTypes: LISTABLE_SCORE_TYPES,
         includeHasMetadata: true,
         onParseError: traceException,
       });
@@ -160,38 +279,70 @@ export const traceRouter = createTRPCRouter({
     .input(
       z.object({
         projectId: z.string(),
-        timestampFilter: timeFilter.optional(),
+        timestampFilter: z.array(timeFilter).optional(),
       }),
     )
     .query(async ({ input }) => {
       const { timestampFilter } = input;
+      // Trace table filters/columns operate on trace-scoped aggregates: any
+      // score row attached to the trace, whether it lives on the trace itself
+      // or on one of the trace's observations.
+      const traceScopedScoreFilters = [
+        ...(timestampFilter ?? []),
+        ...scoreFilters.forTraceScopedAggregates(),
+      ];
 
-      const [numericScoreNames, categoricalScoreNames, traceNames, tags] =
-        await Promise.all([
-          getNumericScoresGroupedByName(
-            input.projectId,
-            timestampFilter ? [timestampFilter] : [],
-          ),
-          getCategoricalScoresGroupedByName(
-            input.projectId,
-            timestampFilter ? [timestampFilter] : [],
-          ),
-          getTracesGroupedByName(
-            input.projectId,
-            tracesTableUiColumnDefinitions,
-            timestampFilter ? [timestampFilter] : [],
-          ),
-          getTracesGroupedByTags({
-            projectId: input.projectId,
-            filter: timestampFilter ? [timestampFilter] : [],
-          }),
-        ]);
+      const [
+        numericScoreNames,
+        categoricalScoreNames,
+        traceNames,
+        tags,
+        userIds,
+        sessionIds,
+      ] = await Promise.all([
+        getNumericScoresGroupedByName(input.projectId, traceScopedScoreFilters),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          traceScopedScoreFilters,
+        ),
+        getTracesGroupedByName(
+          input.projectId,
+          tracesTableUiColumnDefinitions,
+          timestampFilter ?? [],
+        ),
+        getTracesGroupedByTags({
+          projectId: input.projectId,
+          filter: timestampFilter ?? [],
+        }),
+        getTracesGroupedByUsers(
+          input.projectId,
+          timestampFilter ?? [],
+          undefined,
+          100,
+          0,
+        ),
+        getTracesGroupedBySessionId(
+          input.projectId,
+          timestampFilter ?? [],
+          undefined,
+          100,
+          0,
+        ),
+      ]);
 
       return {
-        name: traceNames.map((n) => ({ value: n.name })),
+        name: traceNames.map((n) => ({ value: n.name, count: n.count })),
         scores_avg: numericScoreNames.map((s) => s.name),
         score_categories: categoricalScoreNames,
         tags: tags,
+        users: userIds.map((u) => ({
+          value: u.user,
+          count: u.count,
+        })),
+        sessions: sessionIds.map((s) => ({
+          value: s.session_id,
+          count: s.count,
+        })),
       };
     }),
   byId: protectedGetTraceProcedure
@@ -201,7 +352,7 @@ export const traceRouter = createTRPCRouter({
         projectId: z.string(), // used for security check
         timestamp: z.date().nullish(), // timestamp of the trace. Used to query CH more efficiently
         fromTimestamp: z.date().nullish(), // min timestamp of the trace. Used to query CH more efficiently
-        truncated: z.boolean().default(false), // used to truncate the input and output
+        verbosity: z.enum(["compact", "truncated", "full"]).default("full"),
       }),
     )
     .query(async ({ ctx }) => {
@@ -231,14 +382,14 @@ export const traceRouter = createTRPCRouter({
         });
       }
 
-      const [observations, scores] = await Promise.all([
+      const [observations, traceScores] = await Promise.all([
         getObservationsForTrace({
           traceId: input.traceId,
           projectId: input.projectId,
           timestamp: input.timestamp ?? input.fromTimestamp ?? undefined,
           includeIO: false,
         }),
-        getScoresForTraces({
+        getScoresAndCorrectionsForTraces({
           projectId: input.projectId,
           traceIds: [input.traceId],
           timestamp: input.timestamp ?? input.fromTimestamp ?? undefined,
@@ -246,9 +397,15 @@ export const traceRouter = createTRPCRouter({
       ]);
 
       const validatedScores = filterAndValidateDbScoreList({
-        scores,
+        scores: traceScores,
+        dataTypes: [...ScoreDataTypeArray],
         onParseError: traceException,
       });
+
+      const [corrections, scores] = partition(
+        validatedScores,
+        (s) => s.dataType === ScoreDataTypeEnum.CORRECTION,
+      );
 
       const obsStartTimes = observations
         .map((o) => o.startTime)
@@ -268,23 +425,20 @@ export const traceRouter = createTRPCRouter({
               : undefined
           : undefined;
 
+      const scoresDomain =
+        toDomainArrayWithStringifiedMetadata<ScoreDomain>(scores);
+
       return {
-        ...ctx.trace,
-        metadata: ctx.trace.metadata
-          ? JSON.stringify(ctx.trace.metadata)
-          : null,
+        ...toDomainWithStringifiedMetadata(ctx.trace),
         input: ctx.trace.input ? JSON.stringify(ctx.trace.input) : null,
         output: ctx.trace.output ? JSON.stringify(ctx.trace.output) : null,
-        scores: validatedScores.map((s) => ({
-          ...s,
-          metadata: s.metadata ? JSON.stringify(s.metadata) : undefined,
-        })),
+        scores: scoresDomain,
+        corrections,
         latency: latencyMs !== undefined ? latencyMs / 1000 : undefined,
         observations: observations.map((o) => ({
-          ...o,
+          ...toDomainWithStringifiedMetadata(o),
           output: undefined,
           input: undefined, // this is not queried above.
-          metadata: o.metadata ? JSON.stringify(o.metadata) : undefined,
         })) as ObservationReturnTypeWithMetadata[],
       };
     }),
@@ -313,7 +467,7 @@ export const traceRouter = createTRPCRouter({
       if (input.isBatchAction && input.query) {
         await createBatchActionJob({
           projectId: input.projectId,
-          actionId: "trace-delete",
+          actionId: ActionId.TraceDelete,
           actionType: BatchActionType.Delete,
           tableName: BatchExportTableName.Traces,
           session: ctx.session,
@@ -359,15 +513,27 @@ export const traceRouter = createTRPCRouter({
 
         let trace;
 
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
         const clickhouseTrace = await getTraceById({
           traceId: input.traceId,
           projectId: input.projectId,
-          clickhouseFeatureTag: "tracing-trpc",
         });
         if (clickhouseTrace) {
           trace = clickhouseTrace;
           clickhouseTrace.bookmarked = input.bookmarked;
-          await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
+          const promises = [
+            upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace)),
+          ];
+          if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE !== "legacy") {
+            promises.push(
+              updateEvents(
+                input.projectId,
+                { traceIds: [clickhouseTrace.id], rootOnly: true },
+                { bookmarked: input.bookmarked },
+              ),
+            );
+          }
+          await Promise.all(promises);
         } else {
           logger.error(
             `Trace not found in Clickhouse: ${input.traceId}. Skipping bookmark.`,
@@ -405,10 +571,10 @@ export const traceRouter = createTRPCRouter({
           after: input.public,
         });
 
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
         const clickhouseTrace = await getTraceById({
           traceId: input.traceId,
           projectId: input.projectId,
-          clickhouseFeatureTag: "tracing-trpc",
         });
         if (!clickhouseTrace) {
           logger.error(
@@ -420,7 +586,19 @@ export const traceRouter = createTRPCRouter({
           });
         }
         clickhouseTrace.public = input.public;
-        await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
+        const promises = [
+          upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace)),
+        ];
+        if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE !== "legacy") {
+          promises.push(
+            updateEvents(
+              input.projectId,
+              { traceIds: [clickhouseTrace.id] },
+              { public: input.public },
+            ),
+          );
+        }
+        await Promise.all(promises);
         return clickhouseTrace;
       } catch (error) {
         logger.error("Failed to call traces.publish", error);
@@ -429,60 +607,16 @@ export const traceRouter = createTRPCRouter({
         });
       }
     }),
-  updateTags: protectedProjectProcedure
-    .input(
-      z.object({
-        projectId: z.string(),
-        traceId: z.string(),
-        tags: z.array(z.string()),
-      }),
-    )
-    .mutation(async ({ input, ctx }) => {
-      throwIfNoProjectAccess({
-        session: ctx.session,
-        projectId: input.projectId,
-        scope: "objects:tag",
-      });
-      try {
-        await auditLog({
-          session: ctx.session,
-          resourceType: "trace",
-          resourceId: input.traceId,
-          action: "updateTags",
-          after: input.tags,
-        });
-
-        const clickhouseTrace = await getTraceById({
-          traceId: input.traceId,
-          projectId: input.projectId,
-          clickhouseFeatureTag: "tracing-trpc",
-        });
-        if (!clickhouseTrace) {
-          logger.error(
-            `Trace not found in Clickhouse: ${input.traceId}. Skipping tag update.`,
-          );
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Trace not found",
-          });
-        }
-        clickhouseTrace.tags = input.tags;
-        await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
-      } catch (error) {
-        logger.error("Failed to call traces.updateTags", error);
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-        });
-      }
-    }),
-
-  getAgentGraphData: protectedProjectProcedure
+  getAgentGraphData: protectedGetTraceProcedure
     .input(
       z.object({
         projectId: z.string(),
         traceId: z.string(),
         minStartTime: z.string(),
         maxStartTime: z.string(),
+        // Optional fields for enforceTraceAccess middleware (supports public traces)
+        timestamp: z.date().nullish(),
+        fromTimestamp: z.date().nullish(),
       }),
     )
     .query(async ({ input }): Promise<Required<AgentGraphDataResponse>[]> => {

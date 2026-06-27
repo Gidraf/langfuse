@@ -3,18 +3,12 @@ import { Button } from "@/src/components/ui/button";
 import { Card } from "@/src/components/ui/card";
 import { CodeView } from "@/src/components/ui/CodeJsonViewer";
 import { Input } from "@/src/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/src/components/ui/dialog";
+import { ConfirmDialog } from "@/src/components/ui/confirm-dialog";
 import {
   Table,
   TableBody,
   TableCell,
+  TableCellWithCopyButton,
   TableHead,
   TableHeader,
   TableRow,
@@ -24,17 +18,19 @@ import { CreateApiKeyButton } from "@/src/features/public-api/components/CreateA
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { api } from "@/src/utils/api";
-import { DialogDescription } from "@radix-ui/react-dialog";
 import { TrashIcon } from "lucide-react";
 import { useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
-import { startCase } from "lodash";
+import startCase from "lodash/startCase";
+import { useLangfuseEnvCode } from "@/src/features/public-api/hooks/useLangfuseEnvCode";
 
 type ApiKeyScope = "project" | "organization";
 type ApiKeyEntity = { id: string; note: string | null };
 
 export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
   const { entityId, scope } = props;
+  const envCode = useLangfuseEnvCode();
+
   if (!entityId) {
     throw new Error(
       `${scope}Id is required for ApiKeyList with scope ${scope}`,
@@ -80,7 +76,7 @@ export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
   }
 
   return (
-    <div>
+    <div className="space-y-4">
       <Header
         title={startCase(`${scope} API keys`)}
         help={{
@@ -90,12 +86,18 @@ export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
               ? "https://langfuse.com/docs/api#authentication"
               : "https://langfuse.com/docs/api#org-scoped-routes",
         }}
+        actionButtons={<CreateApiKeyButton entityId={entityId} scope={scope} />}
+      />
+      <CodeView
+        content={envCode}
+        title=".env"
+        copiedToClipboardMessage="Secrets are not included, create a new key to copy them."
       />
       <Card className="mb-4 overflow-hidden">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="hidden text-primary md:table-cell">
+              <TableHead className="text-primary hidden md:table-cell">
                 Created
               </TableHead>
               <TableHead className="text-primary">Note</TableHead>
@@ -108,7 +110,11 @@ export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
           <TableBody className="text-muted-foreground">
             {apiKeysQuery.data?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-center">
+                <TableCell
+                  density="comfortable"
+                  colSpan={5}
+                  className="text-center"
+                >
                   None
                 </TableCell>
               </TableRow>
@@ -118,29 +124,31 @@ export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
                   key={apiKey.id}
                   className="hover:bg-primary-foreground"
                 >
-                  <TableCell className="hidden md:table-cell">
+                  <TableCell
+                    density="comfortable"
+                    className="hidden md:table-cell"
+                  >
                     {apiKey.createdAt.toLocaleDateString()}
                   </TableCell>
-                  <TableCell>
+                  <TableCell density="comfortable">
                     <ApiKeyNote
                       apiKey={apiKey}
                       entityId={entityId}
                       scope={scope}
                     />
                   </TableCell>
-                  <TableCell className="font-mono">
-                    <CodeView
-                      className="inline-block text-xs"
-                      content={apiKey.publicKey}
-                    />
-                  </TableCell>
-                  <TableCell className="font-mono">
+                  <TableCellWithCopyButton
+                    density="comfortable"
+                    text={apiKey.publicKey}
+                    className="truncate font-mono"
+                  />
+                  <TableCell density="comfortable" className="font-mono">
                     {apiKey.displaySecretKey}
                   </TableCell>
                   {/* <TableCell>
                   {apiKey.lastUsedAt?.toLocaleDateString() ?? "Never"}
                 </TableCell> */}
-                  <TableCell>
+                  <TableCell density="comfortable">
                     <DeleteApiKeyButton
                       entityId={entityId}
                       apiKeyId={apiKey.id}
@@ -153,7 +161,6 @@ export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
           </TableBody>
         </Table>
       </Card>
-      <CreateApiKeyButton entityId={entityId} scope={scope} />
     </div>
   );
 }
@@ -223,36 +230,20 @@ function DeleteApiKeyButton(props: {
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
+    <ConfirmDialog
+      open={open}
+      onOpenChange={setOpen}
+      trigger={
         <Button variant="ghost" size="icon">
           <TrashIcon className="h-4 w-4" />
         </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle className="mb-5">Delete API key</DialogTitle>
-          <DialogDescription>
-            Are you sure you want to delete this API key? This action cannot be
-            undone.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button
-            variant="destructive"
-            onClick={handleDelete}
-            loading={
-              mutDeleteOrgApiKey.isPending || mutDeleteProjectApiKey.isPending
-            }
-          >
-            Permanently delete
-          </Button>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
-            Cancel
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+      }
+      title="Delete API key"
+      description="Are you sure you want to delete this API key? This action cannot be undone."
+      confirmLabel="Permanently delete"
+      loading={mutDeleteOrgApiKey.isPending || mutDeleteProjectApiKey.isPending}
+      onConfirm={handleDelete}
+    />
   );
 }
 
@@ -324,7 +315,7 @@ function ApiKeyNote({
   return (
     <div
       onClick={() => setIsEditing(true)}
-      className="-mx-2 cursor-pointer rounded px-2 py-1 hover:bg-secondary/50"
+      className="hover:bg-secondary/50 -mx-2 cursor-pointer rounded px-2 py-1"
     >
       {note || "Click to add note"}
     </div>

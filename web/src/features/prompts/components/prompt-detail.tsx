@@ -6,8 +6,8 @@ import {
   useQueryParam,
   withDefault,
 } from "use-query-params";
-import type { z } from "zod/v4";
-import { OpenAiMessageView } from "@/src/components/trace/IOPreview";
+import type { z } from "zod";
+import { OpenAiMessageView } from "@/src/components/trace/components/IOPreview/components/ChatMessageList";
 import {
   TabsBar,
   TabsBarList,
@@ -59,8 +59,12 @@ import { TagPromptDetailsPopover } from "@/src/features/tag/components/TagPrompt
 import { SetPromptVersionLabels } from "@/src/features/prompts/components/SetPromptVersionLabels";
 import { CommentDrawerButton } from "@/src/features/comments/CommentDrawerButton";
 import { Command, CommandInput } from "@/src/components/ui/command";
-import { renderRichPromptContent } from "@/src/features/prompts/components/prompt-content-utils";
+import {
+  PromptReferenceProvider,
+  renderRichPromptContent,
+} from "@/src/components/ui/PromptReferences";
 import { PromptVariableListPreview } from "@/src/features/prompts/components/PromptVariableListPreview";
+import { createBreadcrumbItems } from "@/src/features/folders/utils";
 
 const getPythonCode = (
   name: string,
@@ -86,20 +90,20 @@ const getJsCode = (
   name: string,
   version: number,
   labels: string[],
-) => `import { Langfuse } from "langfuse";
+) => `import { LangfuseClient } from "@langfuse/client";
 
 // Initialize the Langfuse client
-const langfuse = new Langfuse();
+const langfuse = new LangfuseClient();
 
 // Get production prompt
-const prompt = await langfuse.getPrompt("${name}");
+const prompt = await langfuse.prompt.get("${name}");
 
 // Get by label
 // You can use as many labels as you'd like to identify different deployment targets
-${labels.length > 0 ? labels.map((label) => `const prompt = await langfuse.getPrompt("${name}", undefined, { label: "${label}" })`).join("\n") : ""}
+${labels.length > 0 ? labels.map((label) => `const prompt = await langfuse.prompt.get("${name}", { label: "${label}" })`).join("\n") : ""}
 
 // Get by version number, usually not recommended as it requires code changes to deploy new prompt versions
-langfuse.getPrompt("${name}", ${version})
+await langfuse.prompt.get("${name}", { version: ${version} })
 `;
 
 export const PromptDetail = ({
@@ -141,13 +145,21 @@ export const PromptDetail = ({
     projectId,
     scope: "promptExperiments:CUD",
   });
-  const promptHistory = api.prompts.allVersions.useQuery(
-    {
+  const hasCommentReadAccess = useHasProjectAccess({
+    projectId,
+    scope: "comments:read",
+  });
+  const promptHistoryInput = useMemo(
+    () => ({
       name: promptName,
       projectId: projectId as string, // Typecast as query is enabled only when projectId is present
-    },
-    { enabled: Boolean(projectId) },
+      includeCommentCounts: hasCommentReadAccess,
+    }),
+    [hasCommentReadAccess, projectId, promptName],
   );
+  const promptHistory = api.prompts.allVersions.useQuery(promptHistoryInput, {
+    enabled: Boolean(projectId),
+  });
   const prompt = currentPromptVersion
     ? promptHistory.data?.promptVersions.find(
         (prompt) => prompt.version === currentPromptVersion,
@@ -194,13 +206,13 @@ export const PromptDetail = ({
   }) => {
     setIsCreateExperimentDialogOpen(false);
     if (!data) return;
-    void utils.datasets.baseRunDataByDatasetId.invalidate();
-    void utils.datasets.runsByDatasetId.invalidate();
+    utils.datasets.baseRunDataByDatasetId.invalidate();
+    utils.datasets.runsByDatasetId.invalidate();
     showSuccessToast({
-      title: "Dataset run triggered successfully",
-      description: "Waiting for dataset run to complete...",
+      title: "Experiment triggered successfully",
+      description: "Waiting for experiment to complete...",
       link: {
-        text: "View dataset run",
+        text: "View experiment",
         href: `/project/${projectId}/datasets/${data.datasetId}/compare?runs=${data.runId}`,
       },
     });
@@ -226,22 +238,7 @@ export const PromptDetail = ({
     ).data?.tags ?? []
   ).map((t) => t.value);
 
-  const commentCounts = api.comments.getCountByObjectId.useQuery(
-    {
-      projectId: projectId as string,
-      objectId: prompt?.id as string,
-      objectType: "PROMPT",
-    },
-    {
-      enabled: Boolean(projectId) && Boolean(prompt?.id),
-      trpc: {
-        context: {
-          skipBatch: true,
-        },
-      },
-      refetchOnMount: false, // prevents refetching loops
-    },
-  );
+  const commentCounts = promptHistory.data?.commentCounts;
 
   const { pythonCode, jsCode } = useMemo(() => {
     if (!prompt?.id) return { pythonCode: null, jsCode: null };
@@ -270,10 +267,16 @@ export const PromptDetail = ({
       )
     : [];
 
+  const segments = promptName.split("/").filter((s) => s.trim());
+  const folderPath = segments.length > 1 ? segments.slice(0, -1).join("/") : "";
+  const breadcrumbItems = folderPath ? createBreadcrumbItems(folderPath) : [];
+
   return (
     <Page
       headerProps={{
         title: prompt.name,
+        titleTooltip:
+          "Prompt names cannot be changed. Instead, duplicate this prompt to a different name.",
         itemType: "PROMPT",
         help: {
           description:
@@ -285,6 +288,10 @@ export const PromptDetail = ({
             name: "Prompts",
             href: `/project/${projectId}/prompts/`,
           },
+          ...breadcrumbItems.map((item) => ({
+            name: item.name,
+            href: `/project/${projectId}/prompts?folder=${encodeURIComponent(item.folderPath)}`,
+          })),
         ],
         tabsProps: {
           tabs: getPromptTabs(projectId as string, promptName as string),
@@ -296,6 +303,7 @@ export const PromptDetail = ({
             availableTags={allTags}
             projectId={projectId as string}
             promptName={prompt.name}
+            includeCommentCounts={promptHistoryInput.includeCommentCounts}
           />
         ),
         actionButtonsRight: (
@@ -321,26 +329,26 @@ export const PromptDetail = ({
       }}
     >
       <div className="grid flex-1 grid-cols-3 gap-4 overflow-hidden px-3 md:grid-cols-4">
-        <Command className="flex flex-col gap-2 overflow-y-auto rounded-none border-r pr-3 font-medium focus:outline-none focus:ring-0 focus-visible:outline-none focus-visible:ring-0 focus-visible:ring-offset-0 data-[focus]:ring-0">
+        <Command className="flex flex-col gap-2 overflow-y-auto rounded-none border-r pr-3 font-medium focus:ring-0 focus:outline-hidden focus-visible:ring-0 focus-visible:ring-offset-0 focus-visible:outline-hidden data-focus:ring-0">
           <div className="mt-3 flex items-center justify-between">
             <CommandInput
               showBorder={false}
-              placeholder="Search versions"
-              className="h-fit border-none py-0 text-sm font-light text-muted-foreground focus:ring-0"
+              placeholder="Search..."
+              className="text-muted-foreground h-fit border-none py-0 text-sm font-light focus:ring-0"
             />
 
             <Button
               onClick={() => {
                 capture("prompts:update_form_open");
               }}
-              className="h-6 w-6 shrink-0 px-1 md:h-8 md:w-fit md:px-3"
+              className="h-6 w-6 shrink-0 px-1 lg:h-8 lg:w-fit lg:px-3"
             >
               <Link
                 className="grid w-full place-items-center md:grid-flow-col"
                 href={`/project/${projectId}/prompts/new?promptId=${encodeURIComponent(prompt.id)}`}
               >
                 <Plus className="h-4 w-4 md:mr-2" />
-                <span className="hidden md:inline">New</span>
+                <span className="hidden lg:inline">New version</span>
               </Link>
             </Button>
           </div>
@@ -352,19 +360,19 @@ export const PromptDetail = ({
                 setCurrentPromptVersion(version);
                 setCurrentPromptLabel(null);
               }}
-              totalCount={promptHistory.data.totalCount}
+              commentCounts={commentCounts}
             />
           </div>
         </Command>
         <div className="col-span-2 mt-3 flex max-h-full min-h-0 flex-col md:col-span-3">
           <div className="flex flex-col items-start gap-2">
-            <div className="grid w-full min-w-0 grid-cols-[auto,auto] items-center justify-between">
-              <div className="flex min-w-0 max-w-full flex-shrink flex-col">
-                <div className="flex min-w-0 max-w-full flex-wrap items-start gap-1">
+            <div className="grid w-full min-w-0 grid-cols-[auto_auto] items-center justify-between">
+              <div className="flex max-w-full min-w-0 shrink flex-col">
+                <div className="flex max-w-full min-w-0 flex-wrap items-start gap-1">
                   <SetPromptVersionLabels
                     title={
                       <div
-                        className="contents !cursor-default"
+                        className="contents cursor-default!"
                         onClick={(e) => e.stopPropagation()}
                       >
                         <Badge
@@ -373,7 +381,7 @@ export const PromptDetail = ({
                         >
                           # {prompt.version}
                         </Badge>
-                        <span className="mb-0 line-clamp-2 min-w-0 break-all text-lg font-medium md:break-normal md:break-words">
+                        <span className="mb-0 line-clamp-2 min-w-0 text-lg font-medium break-all md:break-normal md:wrap-break-word">
                           {prompt.commitMessage ?? prompt.name}
                         </span>
                       </div>
@@ -410,11 +418,11 @@ export const PromptDetail = ({
                       >
                         <FlaskConical className="h-4 w-4" />
                         <span className="hidden md:ml-2 md:inline">
-                          Dataset run
+                          Run experiment
                         </span>
                       </Button>
                     </DialogTrigger>
-                    <DialogContent className="max-h-[90vh] overflow-y-auto">
+                    <DialogContent className="max-h-[90vh] max-w-3xl overflow-y-auto">
                       <CreateExperimentsForm
                         key={`create-experiment-form-${prompt.id}`}
                         projectId={projectId as string}
@@ -435,8 +443,11 @@ export const PromptDetail = ({
                   projectId={projectId as string}
                   objectId={prompt.id}
                   objectType="PROMPT"
-                  count={getNumberFromMap(commentCounts?.data, prompt.id)}
+                  count={getNumberFromMap(commentCounts, prompt.id)}
                   variant="outline"
+                  onCommentChange={() =>
+                    utils.prompts.allVersions.invalidate(promptHistoryInput)
+                  }
                 />
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -446,7 +457,7 @@ export const PromptDetail = ({
                   </DropdownMenuTrigger>
                   <DropdownMenuContent
                     align="end"
-                    className="flex flex-col [&>*]:w-full [&>*]:justify-start"
+                    className="flex flex-col *:w-full *:justify-start"
                   >
                     <DropdownMenuItem asChild>
                       <DeletePromptVersion
@@ -465,7 +476,7 @@ export const PromptDetail = ({
             className="min-h-0"
             onValueChange={(value) => setCurrentTab(value)}
           >
-            <TabsBarList className="min-w-0 max-w-full justify-start overflow-x-auto">
+            <TabsBarList className="max-w-full min-w-0 justify-start overflow-x-auto">
               <TabsBarTrigger value="prompt">Prompt</TabsBarTrigger>
               <TabsBarTrigger value="config">Config</TabsBarTrigger>
               <TabsBarTrigger value="linked-generations">
@@ -475,14 +486,14 @@ export const PromptDetail = ({
             </TabsBarList>
             <TabsBarContent
               value="linked-generations"
-              className="mb-2 mt-0 flex max-h-full min-h-0 flex-1 flex-col overflow-hidden"
+              className="mt-0 mb-2 flex max-h-full min-h-0 flex-1 flex-col overflow-hidden"
             >
               <div className="flex h-full flex-1 flex-col overflow-hidden">
                 <Generations
                   projectId={prompt.projectId}
                   promptName={prompt.name}
                   promptVersion={prompt.version}
-                  omittedFilter={["Prompt Name", "Prompt Version"]}
+                  omittedFilter={["promptName"]}
                 />
               </div>
             </TabsBarContent>
@@ -516,34 +527,36 @@ export const PromptDetail = ({
                     </Tabs>
                   </div>
                 )}
-                {prompt.type === PromptType.Chat && chatMessages ? (
-                  <div className="w-full">
-                    <OpenAiMessageView
-                      messages={chatMessages}
-                      collapseLongHistory={false}
-                      projectIdForPromptButtons={projectId}
-                    />
-                  </div>
-                ) : typeof prompt.prompt === "string" ? (
-                  resolutionMode === "resolved" &&
-                  promptGraph.data?.resolvedPrompt ? (
-                    <CodeView
-                      content={String(promptGraph.data.resolvedPrompt)}
-                      title="Text Prompt (resolved)"
-                    />
+                <PromptReferenceProvider projectId={projectId}>
+                  {prompt.type === PromptType.Chat && chatMessages ? (
+                    <div className="w-full">
+                      {/* eslint-disable-next-line @typescript-eslint/no-deprecated -- Internal backwards-compatible component alias. */}
+                      <OpenAiMessageView
+                        messages={chatMessages}
+                        shouldRenderMarkdown={true}
+                        currentView="pretty"
+                        messageToToolCallNumbers={new Map()}
+                        collapseLongHistory={false}
+                      />
+                    </div>
+                  ) : typeof prompt.prompt === "string" ? (
+                    resolutionMode === "resolved" &&
+                    promptGraph.data?.resolvedPrompt ? (
+                      <CodeView
+                        content={String(promptGraph.data.resolvedPrompt)}
+                        title="Text Prompt (resolved)"
+                      />
+                    ) : (
+                      <CodeView
+                        content={renderRichPromptContent(prompt.prompt)}
+                        originalContent={prompt.prompt}
+                        title="Text Prompt"
+                      />
+                    )
                   ) : (
-                    <CodeView
-                      content={renderRichPromptContent(
-                        projectId as string,
-                        prompt.prompt,
-                      )}
-                      originalContent={prompt.prompt}
-                      title="Text Prompt"
-                    />
-                  )
-                ) : (
-                  <JSONView json={prompt.prompt} title="Prompt" />
-                )}
+                    <JSONView json={prompt.prompt} title="Prompt" />
+                  )}
+                </PromptReferenceProvider>
                 <PromptVariableListPreview variables={extractedVariables} />
               </div>
             </TabsBarContent>
@@ -566,7 +579,7 @@ export const PromptDetail = ({
               <div className="flex h-full min-h-0 w-full flex-col gap-2 overflow-y-auto pb-4">
                 {pythonCode && <CodeView content={pythonCode} title="Python" />}
                 {jsCode && <CodeView content={jsCode} title="JS/TS" />}
-                <p className="pl-1 text-xs text-muted-foreground">
+                <p className="text-muted-foreground pl-1 text-xs">
                   See{" "}
                   <a
                     href="https://langfuse.com/docs/prompts"

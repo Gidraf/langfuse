@@ -1,13 +1,21 @@
 import { useState, useCallback, useMemo } from "react";
-import { type EvalTemplate } from "@langfuse/shared";
+import {
+  type EvalTemplate,
+  EvalTemplateType,
+  isJobConfigExecutable,
+  JobConfigState,
+} from "@langfuse/shared";
 import { type RouterOutputs } from "@/src/utils/api";
 import { type PartialConfig } from "@/src/features/evals/types";
-import { partition } from "lodash";
 
 const partitionEvaluators = (
   evaluators: RouterOutputs["evals"]["jobConfigsByTarget"] | undefined,
   datasetId: string,
-): { activeEvaluators: string[]; inActiveEvaluators: string[] } => {
+): {
+  activeEvaluators: string[];
+  pausedEvaluators: string[];
+  evaluatorTargetObjects: Record<string, string>;
+} => {
   const filteredEvaluators =
     evaluators?.filter(({ filter }) => {
       if (filter?.length === 0) return true;
@@ -17,21 +25,35 @@ const partitionEvaluators = (
       );
     }) || [];
 
-  const [activeEvaluators, inActiveEvaluators] = partition(
-    filteredEvaluators,
-    (evaluator) => evaluator.status === "ACTIVE",
+  const activeEvaluators = filteredEvaluators.filter((evaluator) =>
+    isJobConfigExecutable({
+      status: evaluator.status,
+      blockedAt: evaluator.blockedAt,
+    }),
+  );
+  const pausedEvaluators = filteredEvaluators.filter(
+    (evaluator) =>
+      evaluator.status === JobConfigState.ACTIVE &&
+      evaluator.blockedAt !== null,
   );
 
   const activeIds = activeEvaluators.map(
     (evaluator) => evaluator.evalTemplateId,
   );
-  const inactiveIds = inActiveEvaluators.map(
+  const pausedIds = pausedEvaluators.map(
     (evaluator) => evaluator.evalTemplateId,
   );
 
+  // Build a map of template ID to target object for displaying legacy badges
+  const evaluatorTargetObjects: Record<string, string> = {};
+  for (const evaluator of filteredEvaluators) {
+    evaluatorTargetObjects[evaluator.evalTemplateId] = evaluator.targetObject;
+  }
+
   return {
     activeEvaluators: activeIds,
-    inActiveEvaluators: inactiveIds,
+    pausedEvaluators: pausedIds,
+    evaluatorTargetObjects,
   };
 };
 
@@ -83,8 +105,11 @@ export function useExperimentEvaluatorData({
           ...config,
           evalTemplate: {
             ...config.evalTemplate,
-            outputSchema: config.evalTemplate
-              .outputSchema as EvalTemplate["outputSchema"],
+            type: EvalTemplateType.LLM_AS_JUDGE,
+            sourceCode: null,
+            sourceCodeLanguage: null,
+            outputDefinition: config.evalTemplate
+              .outputDefinition as EvalTemplate["outputDefinition"],
           },
         } as PartialConfig & { evalTemplate: EvalTemplate };
 
@@ -135,7 +160,7 @@ export function useExperimentEvaluatorData({
   const handleEvaluatorSuccess = useCallback(() => {
     setShowEvaluatorForm(false);
     setSelectedEvaluatorData(null);
-    void refetchEvaluators();
+    refetchEvaluators();
   }, [refetchEvaluators]);
 
   // Handle when a user selects an evaluator from the template selector
@@ -151,16 +176,18 @@ export function useExperimentEvaluatorData({
     [prepareEvaluatorData],
   );
 
-  const { activeEvaluators, inActiveEvaluators } = useMemo(() => {
-    return partitionEvaluators(evaluatorsData, datasetId);
-  }, [evaluatorsData, datasetId]);
+  const { activeEvaluators, pausedEvaluators, evaluatorTargetObjects } =
+    useMemo(() => {
+      return partitionEvaluators(evaluatorsData, datasetId);
+    }, [evaluatorsData, datasetId]);
 
   return {
     // State
     selectedEvaluatorData,
     showEvaluatorForm,
     activeEvaluators,
-    inActiveEvaluators,
+    pausedEvaluators,
+    evaluatorTargetObjects,
 
     // Handlers
     handleConfigureEvaluator,

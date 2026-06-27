@@ -57,7 +57,7 @@ const QueueItemTableMultiSelectAction = ({
   const mutDeleteItems = api.annotationQueueItems.deleteMany.useMutation({
     onSuccess: () => {
       onDeleteSuccess();
-      void utils.annotationQueueItems.itemsByQueueId.invalidate();
+      utils.annotationQueueItems.itemsByQueueId.invalidate();
     },
   });
 
@@ -106,7 +106,7 @@ const QueueItemTableMultiSelectAction = ({
               loading={mutDeleteItems.isPending}
               disabled={mutDeleteItems.isPending}
               onClick={() => {
-                void mutDeleteItems
+                mutDeleteItems
                   .mutateAsync({
                     itemIds: selectedItemIds,
                     projectId,
@@ -183,6 +183,7 @@ export function AnnotationQueueItemsTable({
       id: "select",
       accessorKey: "select",
       size: 30,
+      isPinnedLeft: true,
       isFixedPosition: true,
       header: ({ table }) => {
         return (

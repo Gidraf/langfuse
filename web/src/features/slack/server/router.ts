@@ -2,8 +2,8 @@ import {
   createTRPCRouter,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
-import { z } from "zod/v4";
-import { SlackService } from "@langfuse/shared/src/server";
+import { z } from "zod";
+import { SlackService, SlackApiError } from "@langfuse/shared/src/server";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { logger } from "@langfuse/shared/src/server";
 import { TRPCError } from "@trpc/server";
@@ -88,7 +88,7 @@ export const slackRouter = createTRPCRouter({
    * Get channels for a project's Slack integration
    */
   getChannels: protectedProjectProcedure
-    .input(z.object({ projectId: z.string() }))
+    .input(z.object({ projectId: z.string(), cursor: z.string().optional() }))
     .query(async ({ ctx, input }) => {
       throwIfNoProjectAccess({
         session: ctx.session,
@@ -112,18 +112,27 @@ export const slackRouter = createTRPCRouter({
         const client = await slackService.getWebClientForProject(
           input.projectId,
         );
-        const channels = await slackService.getChannels(client);
+        const { channels, hasPrivateChannelAccess, nextCursor } =
+          await slackService.getChannels(client, input.cursor);
 
-        await auditLog({
-          session: ctx.session,
-          resourceType: "slackIntegration",
-          resourceId: integration.id,
-          action: "read",
-          after: { action: "channels_fetched", channelCount: channels.length },
-        });
+        if (!input.cursor) {
+          await auditLog({
+            session: ctx.session,
+            resourceType: "slackIntegration",
+            resourceId: integration.id,
+            action: "read",
+            after: {
+              action: "channels_fetched",
+              channelCount: channels.length,
+              hasNextPage: Boolean(nextCursor),
+            },
+          });
+        }
 
         return {
           channels,
+          hasPrivateChannelAccess,
+          nextCursor,
           teamId: integration.teamId,
           teamName: integration.teamName,
         };
@@ -201,8 +210,9 @@ export const slackRouter = createTRPCRouter({
     .input(
       z.object({
         projectId: z.string(),
+        // Slack resolves both channel IDs (C1234) and names (#general)
         channelId: z.string(),
-        channelName: z.string(),
+        channelName: z.string().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
@@ -253,7 +263,7 @@ export const slackRouter = createTRPCRouter({
               },
               {
                 type: "mrkdwn",
-                text: `*Channel:*\n#${input.channelName}`,
+                text: `*Channel:*\n#${input.channelName ?? input.channelId.replace(/^#/, "")}`,
               },
               {
                 type: "mrkdwn",
@@ -289,6 +299,30 @@ export const slackRouter = createTRPCRouter({
           text: "Test message from Langfuse",
         });
 
+        // For manually-typed channel names (id starts with #), resolve
+        // channel metadata via conversations.info so the UI can show
+        // accurate type/ID info. Skip for channels already selected from
+        // the list since we already have their metadata.
+        let channelInfo: {
+          id: string;
+          name?: string;
+          isPrivate?: boolean;
+        } = { id: result.channel };
+
+        if (input.channelId.startsWith("#")) {
+          const resolved = await SlackService.getInstance().getChannelInfo(
+            client,
+            result.channel,
+          );
+          if (resolved) {
+            channelInfo = {
+              id: resolved.id,
+              name: resolved.name,
+              isPrivate: resolved.isPrivate,
+            };
+          }
+        }
+
         await auditLog({
           session: ctx.session,
           resourceType: "slackIntegration",
@@ -296,7 +330,7 @@ export const slackRouter = createTRPCRouter({
           action: "create",
           after: {
             action: "test_message_sent",
-            channelId: input.channelId,
+            channelId: result.channel,
             channelName: input.channelName,
             messageTs: result.messageTs,
           },
@@ -304,7 +338,7 @@ export const slackRouter = createTRPCRouter({
 
         logger.info("Test message sent successfully", {
           projectId: input.projectId,
-          channelId: input.channelId,
+          channelId: result.channel,
           channelName: input.channelName,
           messageTs: result.messageTs,
         });
@@ -313,6 +347,7 @@ export const slackRouter = createTRPCRouter({
           success: true,
           messageTs: result.messageTs,
           channel: result.channel,
+          channelInfo,
         };
       } catch (error) {
         logger.error("Failed to send test message", {
@@ -321,10 +356,28 @@ export const slackRouter = createTRPCRouter({
           channelId: input.channelId,
         });
 
+        const slackError =
+          error instanceof SlackApiError ? error.slackErrorCode : undefined;
+
+        const userMessage = (() => {
+          switch (slackError) {
+            case "channel_not_found":
+              return 'Channel not found. The channel may not exist or is a private channel the bot has not been invited to. For private channels, invite the app with "/invite @Langfuse" in that channel.';
+            case "not_in_channel":
+              return "The bot is not a member of this channel. Please invite the bot to the channel first.";
+            case "is_archived":
+              return "This channel has been archived and cannot receive messages.";
+            case "invalid_auth":
+            case "token_revoked":
+              return "Slack authentication failed. Please reconnect your Slack workspace.";
+            default:
+              return "Failed to send test message. Please check your Slack connection and channel permissions.";
+          }
+        })();
+
         throw new TRPCError({
           code: "BAD_REQUEST",
-          message:
-            "Failed to send test message. Please check your Slack connection and channel permissions.",
+          message: userMessage,
         });
       }
     }),

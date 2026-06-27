@@ -19,7 +19,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Validate PR title follows conventional commits
-        uses: amannn/action-semantic-pull-request@v6
+        uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -36,6 +36,7 @@ jobs:
             ci
             chore
             revert
+            security
           # Allow scopes (optional)
           requireScope: false
           # Allow any scope (not just the ones listed above)

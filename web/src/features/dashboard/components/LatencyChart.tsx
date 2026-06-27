@@ -1,4 +1,3 @@
-import { api } from "@/src/utils/api";
 import { type FilterState, getGenerationLikeTypes } from "@langfuse/shared";
 import {
   extractTimeSeriesData,
@@ -6,9 +5,7 @@ import {
   isEmptyTimeSeries,
 } from "@/src/features/dashboard/components/hooks";
 import { DashboardCard } from "@/src/features/dashboard/components/cards/DashboardCard";
-import { BaseTimeSeriesChart } from "@/src/features/dashboard/components/BaseTimeSeriesChart";
 import { TabComponent } from "@/src/features/dashboard/components/TabsComponent";
-import { latencyFormatter } from "@/src/utils/numbers";
 import {
   type DashboardDateRangeAggregationOption,
   dashboardDateRangeAggregationSettings,
@@ -18,11 +15,12 @@ import {
   ModelSelectorPopover,
   useModelSelection,
 } from "@/src/features/dashboard/components/ModelSelector";
-import {
-  type QueryType,
-  mapLegacyUiTableFilterToView,
-} from "@/src/features/query";
+import { type QueryType, type ViewVersion } from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
 import type { DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { Chart } from "@/src/features/widgets/chart-library/Chart";
+import { timeSeriesToDataPoints } from "@/src/features/dashboard/lib/chart-data-adapters";
+import { useScheduledDashboardExecuteQuery } from "@/src/hooks/useDashboardQueryScheduler";
 
 export const GenerationLatencyChart = ({
   className,
@@ -32,6 +30,8 @@ export const GenerationLatencyChart = ({
   fromTimestamp,
   toTimestamp,
   isLoading = false,
+  metricsVersion,
+  schedulerId,
 }: {
   className?: string;
   projectId: string;
@@ -40,6 +40,8 @@ export const GenerationLatencyChart = ({
   fromTimestamp: Date;
   toTimestamp: Date;
   isLoading?: boolean;
+  metricsVersion?: ViewVersion;
+  schedulerId?: string;
 }) => {
   const {
     allModels,
@@ -53,7 +55,14 @@ export const GenerationLatencyChart = ({
     globalFilterState,
     fromTimestamp,
     toTimestamp,
+    metricsVersion,
+    {
+      enabled: !isLoading,
+      queryId: `${schedulerId ?? "home:generation-latency"}:all-models`,
+    },
   );
+  const hasModelSelection = selectedModels.length > 0 && allModels.length > 0;
+  const isLatencyEnabled = !isLoading && hasModelSelection;
 
   const latenciesQuery: QueryType = {
     view: "observations",
@@ -81,25 +90,29 @@ export const GenerationLatencyChart = ({
       },
     ],
     timeDimension: {
-      granularity: dashboardDateRangeAggregationSettings[agg].date_trunc,
+      granularity:
+        dashboardDateRangeAggregationSettings[agg].dateTrunc ?? "day",
     },
     fromTimestamp: fromTimestamp.toISOString(),
     toTimestamp: toTimestamp.toISOString(),
     orderBy: null,
   };
 
-  const latencies = api.dashboard.executeQuery.useQuery(
+  const latencies = useScheduledDashboardExecuteQuery(
     {
       projectId,
       query: latenciesQuery,
+      version: metricsVersion,
     },
     {
-      enabled: !isLoading && selectedModels.length > 0 && allModels.length > 0,
+      enabled: isLatencyEnabled,
       trpc: {
         context: {
           skipBatch: true,
         },
       },
+      queryId: `${schedulerId ?? "home:generation-latency"}:latencies`,
+      priority: 1001,
     },
   );
 
@@ -172,13 +185,24 @@ export const GenerationLatencyChart = ({
             content: (
               <>
                 {!isEmptyTimeSeries({ data: item.data }) ? (
-                  <BaseTimeSeriesChart
-                    className="[&_text]:fill-muted-foreground [&_tspan]:fill-muted-foreground"
-                    agg={agg}
-                    data={item.data}
-                    connectNulls={true}
-                    valueFormatter={latencyFormatter}
-                  />
+                  <div className="h-80 w-full shrink-0">
+                    <Chart
+                      chartType="LINE_TIME_SERIES"
+                      data={timeSeriesToDataPoints(item.data, agg)}
+                      config={{
+                        metric: {
+                          label: "Latency",
+                        },
+                      }}
+                      rowLimit={100}
+                      chartConfig={{
+                        type: "LINE_TIME_SERIES",
+                        unit: "millisecond",
+                        show_data_point_dots: false,
+                      }}
+                      legendPosition="above"
+                    />
+                  </div>
                 ) : (
                   <NoDataOrLoading
                     isLoading={isLoading || latencies.isPending}

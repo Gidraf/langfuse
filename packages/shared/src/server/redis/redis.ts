@@ -1,13 +1,18 @@
 import Redis, { RedisOptions, Cluster, ClusterOptions } from "ioredis";
+import type { QueueBaseOptions } from "bullmq";
 import fs from "fs";
 import { env } from "../../env";
 import { logger } from "../logger";
 
 const defaultRedisOptions: Partial<RedisOptions> = {
+  enableReadyCheck: true,
   maxRetriesPerRequest: null,
   enableAutoPipelining: env.REDIS_ENABLE_AUTO_PIPELINING === "true",
-  keyPrefix: env.REDIS_KEY_PREFIX ?? undefined,
+  keepAlive: 10000, // 10s — prevents middleboxes from killing idle connections
+  socketTimeout: 30000, // 30s — forces reconnect if no data received, prevents hung moveToCompleted() from blocking concurrency slots forever
 };
+
+const REDIS_SCAN_COUNT = 1000;
 
 export const redisQueueRetryOptions: Partial<RedisOptions> = {
   retryStrategy: (times: number) => {
@@ -19,28 +24,88 @@ export const redisQueueRetryOptions: Partial<RedisOptions> = {
     return Math.max(Math.min(Math.exp(times), 20000), 1000);
   },
   reconnectOnError: (err) => {
+    // MOVED/ASK are normal cluster redirections handled by ioredis — not real errors.
+    if (err.message.includes("MOVED")) {
+      logger.debug(`Redis cluster redirect: ${err.message}`);
+      return false;
+    }
+
     // Reconnects on READONLY errors and auto-retries the command.
     logger.warn(`Redis connection error: ${err.message}`);
     return err.message.includes("READONLY") ? 2 : false;
   },
 };
 
+type BullMQOptionsWithRedis = Pick<
+  QueueBaseOptions,
+  "connection" | "prefix" | "skipVersionCheck"
+>;
+
 /**
- * Parse Redis cluster nodes from environment variable
+ * Parse Redis node definitions from environment variable
  * Format: "host1:port1,host2:port2,host3:port3"
  */
-const parseClusterNodes = (
+const parseRedisNodes = (
   nodesString: string,
 ): Array<{ host: string; port: number }> => {
   return nodesString.split(",").map((node) => {
     const [host, port] = node.trim().split(":");
     if (!host || !port) {
       throw new Error(
-        `Invalid cluster node format: ${node}. Expected format: host:port`,
+        `Invalid Redis node format: ${node}. Expected format: host:port`,
       );
     }
     return { host, port: parseInt(port, 10) };
   });
+};
+const parseClusterNodes = parseRedisNodes;
+const parseSentinelNodes = parseRedisNodes;
+
+/**
+ * Build TLS options for Redis connections from environment variables
+ * Returns an object with tls configuration if TLS is enabled, otherwise empty object
+ */
+const buildTlsOptions = (): Record<string, unknown> => {
+  if (env.REDIS_TLS_ENABLED !== "true") {
+    return {};
+  }
+
+  return {
+    tls: {
+      ca: env.REDIS_TLS_CA_PATH
+        ? fs.readFileSync(env.REDIS_TLS_CA_PATH)
+        : undefined,
+      cert: env.REDIS_TLS_CERT_PATH
+        ? fs.readFileSync(env.REDIS_TLS_CERT_PATH)
+        : undefined,
+      key: env.REDIS_TLS_KEY_PATH
+        ? fs.readFileSync(env.REDIS_TLS_KEY_PATH)
+        : undefined,
+      ...(env.REDIS_TLS_REJECT_UNAUTHORIZED
+        ? {
+            rejectUnauthorized: env.REDIS_TLS_REJECT_UNAUTHORIZED !== "false",
+          }
+        : {}),
+      ...(env.REDIS_TLS_SERVERNAME
+        ? { servername: env.REDIS_TLS_SERVERNAME }
+        : {}),
+      ...(env.REDIS_TLS_CHECK_SERVER_IDENTITY === "false"
+        ? { checkServerIdentity: () => undefined }
+        : {}),
+      ...(env.REDIS_TLS_SECURE_PROTOCOL
+        ? { secureProtocol: env.REDIS_TLS_SECURE_PROTOCOL }
+        : {}),
+      ...(env.REDIS_TLS_CIPHERS ? { ciphers: env.REDIS_TLS_CIPHERS } : {}),
+      ...(env.REDIS_TLS_HONOR_CIPHER_ORDER
+        ? {
+            honorCipherOrder: env.REDIS_TLS_HONOR_CIPHER_ORDER === "true",
+          }
+        : {}),
+      ...(env.REDIS_TLS_KEY_PASSPHRASE
+        ? { passphrase: env.REDIS_TLS_KEY_PASSPHRASE }
+        : {}),
+    },
+  };
 };
 
 const createRedisClusterInstance = (
@@ -54,28 +119,14 @@ const createRedisClusterInstance = (
   }
 
   const nodes = parseClusterNodes(env.REDIS_CLUSTER_NODES);
-  const tlsOptions =
-    env.REDIS_TLS_ENABLED === "true"
-      ? {
-          tls: {
-            ca: env.REDIS_TLS_CA_PATH
-              ? fs.readFileSync(env.REDIS_TLS_CA_PATH)
-              : undefined,
-            cert: env.REDIS_TLS_CERT_PATH
-              ? fs.readFileSync(env.REDIS_TLS_CERT_PATH)
-              : undefined,
-            key: env.REDIS_TLS_KEY_PATH
-              ? fs.readFileSync(env.REDIS_TLS_KEY_PATH)
-              : undefined,
-          },
-        }
-      : {};
+  const tlsOptions = buildTlsOptions();
 
   const clusterOptions: ClusterOptions = {
     // Return incoming addresses as-is - required for AWS ElastiCache Certificate resolution
     dnsLookup: (address, callback) => {
       callback(null, address);
     },
+    slotsRefreshTimeout: env.REDIS_CLUSTER_SLOTS_REFRESH_TIMEOUT,
     redisOptions: {
       username: env.REDIS_USERNAME || undefined,
       password: env.REDIS_AUTH || undefined,
@@ -96,29 +147,67 @@ const createRedisClusterInstance = (
   return cluster;
 };
 
+const createRedisSentinelInstance = (
+  additionalOptions: Partial<RedisOptions> = {},
+): Redis | null => {
+  if (!env.REDIS_SENTINEL_MASTER_NAME) {
+    logger.error(
+      "REDIS_SENTINEL_MASTER_NAME is required when REDIS_SENTINEL_ENABLED is true",
+    );
+    return null;
+  }
+
+  if (!env.REDIS_SENTINEL_NODES) {
+    logger.error(
+      "REDIS_SENTINEL_NODES is required when REDIS_SENTINEL_ENABLED is true",
+    );
+    return null;
+  }
+
+  const sentinels = parseSentinelNodes(env.REDIS_SENTINEL_NODES);
+  const tlsOptions = buildTlsOptions();
+
+  const instance = new Redis({
+    sentinels,
+    name: env.REDIS_SENTINEL_MASTER_NAME,
+    username: env.REDIS_USERNAME || undefined,
+    password: env.REDIS_AUTH || undefined,
+    sentinelUsername: env.REDIS_SENTINEL_USERNAME || undefined,
+    sentinelPassword: env.REDIS_SENTINEL_PASSWORD || undefined,
+    ...defaultRedisOptions,
+    ...additionalOptions,
+    ...tlsOptions,
+  });
+
+  instance.on("error", (error) => {
+    logger.error("Redis sentinel error", error);
+  });
+
+  return instance;
+};
+
 export const createNewRedisInstance = (
   additionalOptions: Partial<RedisOptions> = {},
 ): Redis | Cluster | null => {
+  if (
+    env.REDIS_CLUSTER_ENABLED === "true" &&
+    env.REDIS_SENTINEL_ENABLED === "true"
+  ) {
+    logger.error(
+      "Invalid Redis configuration: REDIS_CLUSTER_ENABLED and REDIS_SENTINEL_ENABLED cannot both be true",
+    );
+    return null;
+  }
+
   if (env.REDIS_CLUSTER_ENABLED === "true") {
     return createRedisClusterInstance(additionalOptions);
   }
 
-  const tlsOptions =
-    env.REDIS_TLS_ENABLED === "true"
-      ? {
-          tls: {
-            ca: env.REDIS_TLS_CA_PATH
-              ? fs.readFileSync(env.REDIS_TLS_CA_PATH)
-              : undefined,
-            cert: env.REDIS_TLS_CERT_PATH
-              ? fs.readFileSync(env.REDIS_TLS_CERT_PATH)
-              : undefined,
-            key: env.REDIS_TLS_KEY_PATH
-              ? fs.readFileSync(env.REDIS_TLS_KEY_PATH)
-              : undefined,
-          },
-        }
-      : {};
+  if (env.REDIS_SENTINEL_ENABLED === "true") {
+    return createRedisSentinelInstance(additionalOptions);
+  }
+
+  const tlsOptions = buildTlsOptions();
 
   const instance = env.REDIS_CONNECTION_STRING
     ? new Redis(env.REDIS_CONNECTION_STRING, {
@@ -148,15 +237,64 @@ export const createNewRedisInstance = (
 /**
  * Get the queue prefix for BullMQ cluster compatibility
  * In cluster mode, uses hash tags to ensure queue keys are on the same node
- * In single-node mode, returns undefined (no prefix needed)
+ * In single-node mode, returns the configured prefix or undefined
  */
 export const getQueuePrefix = (queueName: string): string | undefined => {
+  const redisKeyPrefix = env.REDIS_KEY_PREFIX;
+
   if (env.REDIS_CLUSTER_ENABLED === "true") {
     // Use hash tags for Redis cluster compatibility
     // This ensures all keys for a queue are placed on the same hash slot
-    return `{${queueName}}`;
+    // Format: {prefix:queueName} ensures all keys land on same slot
+    return redisKeyPrefix
+      ? `{${redisKeyPrefix}:${queueName}}`
+      : `{${queueName}}`;
   }
-  return undefined;
+
+  // Non-cluster mode: Return prefix or undefined
+  return redisKeyPrefix ?? undefined;
+};
+
+const getBullMQOptionsForRedisConnection = (
+  queueName: string,
+  connection: BullMQOptionsWithRedis["connection"],
+): BullMQOptionsWithRedis => ({
+  connection,
+  prefix: getQueuePrefix(queueName),
+  ...(env.LANGFUSE_BULLMQ_SKIP_REDIS_VERSION_CHECK === "true"
+    ? { skipVersionCheck: true }
+    : {}),
+});
+
+/**
+ * Creates a new Redis connection and returns the BullMQ queue options that use it.
+ * Returns null only when the Redis connection cannot be created.
+ */
+export const createBullMQQueueOptionsWithRedis = (
+  queueName: string,
+): BullMQOptionsWithRedis | null => {
+  const connection = createNewRedisInstance({
+    enableOfflineQueue: false,
+    ...redisQueueRetryOptions,
+  });
+
+  return connection
+    ? getBullMQOptionsForRedisConnection(queueName, connection)
+    : null;
+};
+
+/**
+ * Creates a new Redis connection and returns the BullMQ worker options that use it.
+ * Returns null only when the Redis connection cannot be created.
+ */
+export const createBullMQWorkerOptionsWithRedis = (
+  queueName: string,
+): BullMQOptionsWithRedis | null => {
+  const connection = createNewRedisInstance(redisQueueRetryOptions);
+
+  return connection
+    ? getBullMQOptionsForRedisConnection(queueName, connection)
+    : null;
 };
 
 /**
@@ -177,9 +315,74 @@ export const safeMultiDel = async (
   }
 };
 
+const scanKeysForNode = async (
+  client: Redis,
+  pattern: string,
+  collector: Set<string>,
+  keyPrefix: string,
+) => {
+  let cursor = "0";
+  // ioredis keyPrefix is not applied to SCAN patterns, but it is applied to
+  // DEL/GET/SET keys. Scan physical keys and return logical keys to callers.
+  const scanPattern = keyPrefix ? `${keyPrefix}${pattern}` : pattern;
+
+  do {
+    const [nextCursor, keys]: [string, string[]] = await client.scan(
+      cursor,
+      "MATCH",
+      scanPattern,
+      "COUNT",
+      REDIS_SCAN_COUNT,
+    );
+
+    keys.forEach((key) =>
+      collector.add(
+        keyPrefix && key.startsWith(keyPrefix)
+          ? key.slice(keyPrefix.length)
+          : key,
+      ),
+    );
+    cursor = nextCursor;
+  } while (cursor !== "0");
+};
+
+const getRedisKeyPrefix = (redis: Redis | Cluster): string => {
+  const keyPrefix =
+    redis.options?.keyPrefix ??
+    (redis instanceof Cluster ? redis.options.redisOptions?.keyPrefix : "");
+
+  return keyPrefix?.toString() ?? "";
+};
+
+export const scanKeys = async (
+  redis: Redis | Cluster | null,
+  pattern: string,
+): Promise<string[]> => {
+  if (!redis) return [];
+
+  const collectedKeys = new Set<string>();
+  const keyPrefix = getRedisKeyPrefix(redis);
+
+  if (env.REDIS_CLUSTER_ENABLED === "true") {
+    await Promise.all(
+      (redis as Cluster)
+        .nodes("master")
+        .map((node) =>
+          scanKeysForNode(node, pattern, collectedKeys, keyPrefix),
+        ),
+    );
+  } else {
+    await scanKeysForNode(redis as Redis, pattern, collectedKeys, keyPrefix);
+  }
+
+  return Array.from(collectedKeys);
+};
+
 const createRedisClient = () => {
   try {
-    return createNewRedisInstance();
+    return createNewRedisInstance({
+      keyPrefix: env.REDIS_KEY_PREFIX ?? undefined,
+    });
   } catch (e) {
     logger.error("Failed to connect to redis", e);
     return null;
@@ -187,8 +390,7 @@ const createRedisClient = () => {
 };
 
 declare global {
-  // eslint-disable-next-line no-var
-  var redis: undefined | ReturnType<typeof createRedisClient>; // eslint-disable-line no-unused-vars
+  var redis: undefined | ReturnType<typeof createRedisClient>;
 }
 
 export const redis = globalThis.redis ?? createRedisClient();

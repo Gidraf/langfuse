@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import {
   Dialog,
   DialogBody,
@@ -26,14 +27,15 @@ import { TableActionTargetOptions } from "@/src/features/table/components/TableA
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { ActionButton } from "@/src/components/ActionButton";
 import { useOptionalEntitlement } from "@/src/features/entitlements/hooks";
-import { useSelectAll } from "@/src/features/table/hooks/useSelectAll";
 import { type BatchExportTableName } from "@langfuse/shared";
 import { api } from "@/src/utils/api";
-import { Loader2 } from "lucide-react";
+import { targetOptionsQueryMap } from "@/src/features/table/components/targetOptionsQueryMap";
+import Spinner from "@/src/components/design-system/Spinner/Spinner";
 
 type TableActionDialogProps = {
   isOpen: boolean;
   onClose: () => void;
+  onSuccess: () => void;
   action: TableAction;
   projectId: string;
   tableName: BatchExportTableName;
@@ -42,6 +44,7 @@ type TableActionDialogProps = {
 export function TableActionDialog({
   isOpen,
   onClose,
+  onSuccess,
   action,
   projectId,
   tableName,
@@ -50,7 +53,6 @@ export function TableActionDialog({
     projectId,
     scope: action.accessCheck.scope,
   });
-  const { setSelectAll } = useSelectAll(projectId, tableName);
   const hasEntitlement = useOptionalEntitlement(action.accessCheck.entitlement);
   const form = useForm({ defaultValues: { targetId: "" } });
 
@@ -65,18 +67,47 @@ export function TableActionDialog({
     },
   );
 
+  const targetOptions = api.annotationQueues.allNamesAndIds.useQuery(
+    { projectId },
+    {
+      enabled:
+        action.type === "create" &&
+        action.id in targetOptionsQueryMap &&
+        hasEntitlement,
+    },
+  );
+
+  // Auto-select when there's only one option
+  useEffect(() => {
+    const options = targetOptions?.data;
+    if (options?.length === 1 && !form.getValues().targetId) {
+      form.setValue("targetId", options[0].id);
+    }
+  }, [targetOptions?.data, form]);
+
   const handleConfirm = async () => {
-    await action.execute({ projectId, targetId: form.getValues().targetId });
-    setSelectAll(false);
+    if ("execute" in action) {
+      await action.execute({
+        projectId,
+        targetId: form.getValues().targetId,
+      });
+    }
+    onSuccess();
     onClose();
   };
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog
+      open={isOpen}
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+    >
       <DialogContent className="sm:max-w-md">
-        <DialogHeader>
+        <DialogHeader variant="action">
           <DialogTitle>{action.label}</DialogTitle>
-          <DialogDescription>{action.description}</DialogDescription>
         </DialogHeader>
 
         {action.type === "create" && (
@@ -86,6 +117,7 @@ export function TableActionDialog({
               onSubmit={form.handleSubmit(handleConfirm)}
             >
               <DialogBody>
+                <DialogDescription>{action.description}</DialogDescription>
                 <FormField
                   control={form.control}
                   name="targetId"
@@ -93,7 +125,7 @@ export function TableActionDialog({
                     <FormItem>
                       <Select
                         onValueChange={field.onChange}
-                        defaultValue={field.value}
+                        value={field.value}
                       >
                         <FormControl>
                           <SelectTrigger>
@@ -112,11 +144,11 @@ export function TableActionDialog({
                   )}
                 />
               </DialogBody>
-              <DialogFooter>
+              <DialogFooter variant="action">
                 {isInProgress.data && (
                   <div className="flex items-center gap-1">
-                    <Loader2 className="h-3 w-3 animate-spin" />
-                    <p className="text-sm text-muted-foreground">
+                    <Spinner size="xxs" />
+                    <p className="text-muted-foreground text-sm">
                       Batch action is in progress, please wait.
                     </p>
                   </div>
@@ -136,26 +168,31 @@ export function TableActionDialog({
         )}
 
         {action.type === "delete" && (
-          <DialogFooter>
-            {isInProgress.data && (
-              <div className="flex items-center gap-1">
-                <Loader2 className="h-3 w-3 animate-spin" />
-                <p className="text-sm text-muted-foreground">
-                  Batch action is in progress, please wait.
-                </p>
-              </div>
-            )}
-            <ActionButton
-              variant="destructive"
-              hasAccess={hasAccess}
-              hasEntitlement={hasEntitlement}
-              loading={isInProgress.isLoading}
-              disabled={isInProgress.data}
-              onClick={handleConfirm}
-            >
-              Confirm
-            </ActionButton>
-          </DialogFooter>
+          <>
+            <DialogBody>
+              <DialogDescription>{action.description}</DialogDescription>
+            </DialogBody>
+            <DialogFooter variant="action">
+              {isInProgress.data && (
+                <div className="flex items-center gap-1">
+                  <Spinner size="xxs" />
+                  <p className="text-muted-foreground text-sm">
+                    Batch action is in progress, please wait.
+                  </p>
+                </div>
+              )}
+              <ActionButton
+                variant="destructive"
+                hasAccess={hasAccess}
+                hasEntitlement={hasEntitlement}
+                loading={isInProgress.isLoading}
+                disabled={isInProgress.data}
+                onClick={handleConfirm}
+              >
+                Confirm
+              </ActionButton>
+            </DialogFooter>
+          </>
         )}
       </DialogContent>
     </Dialog>

@@ -1,15 +1,28 @@
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import {
-  type IngestionEventType,
   logger,
-  processEventBatch,
+  markProjectIngestFailure,
   OtelIngestionProcessor,
+  markProjectAsOtelUser,
 } from "@langfuse/shared/src/server";
-import { z } from "zod/v4";
+import { z } from "zod";
 import { $root } from "@/src/pages/api/public/otel/otlp-proto/generated/root";
 import { gunzip } from "node:zlib";
+import { ForbiddenError } from "@langfuse/shared";
 import { env } from "@/src/env.mjs";
+
+/** Read a Langfuse header that may arrive with hyphens or underscores. */
+function getLangfuseHeader(
+  headers: Record<string, string | string[] | undefined>,
+  name: string,
+): string | undefined {
+  const hyphenVal = headers[name];
+  if (typeof hyphenVal === "string") return hyphenVal;
+  const underscoreVal = headers[name.replaceAll("-", "_")];
+  if (typeof underscoreVal === "string") return underscoreVal;
+  return undefined;
+}
 
 export const config = {
   api: {
@@ -24,6 +37,16 @@ export default withMiddlewares({
     responseSchema: z.any(),
     rateLimitResource: "ingestion",
     fn: async ({ req, res, auth }) => {
+      // Check if ingestion is suspended due to usage threshold
+      if (auth.scope.isIngestionSuspended) {
+        throw new ForbiddenError(
+          "Ingestion suspended: Usage threshold exceeded. Please upgrade your plan.",
+        );
+      }
+
+      // Mark project as using OTEL API
+      await markProjectAsOtelUser(auth.scope.projectId);
+
       let body: Buffer;
       try {
         body = await new Promise((resolve, reject) => {
@@ -34,7 +57,8 @@ export default withMiddlewares({
         });
       } catch (e) {
         logger.error(`Failed to read request body`, e);
-        return res.status(400).json({ error: "Failed to read request body" });
+        res.status(400);
+        return { error: "Failed to read request body" };
       }
 
       if (req.headers["content-encoding"]?.includes("gzip")) {
@@ -46,9 +70,8 @@ export default withMiddlewares({
           });
         } catch (e) {
           logger.error(`Failed to decompress request body`, e);
-          return res
-            .status(400)
-            .json({ error: "Failed to decompress request body" });
+          res.status(400);
+          return { error: "Failed to decompress request body" };
         }
       }
 
@@ -60,7 +83,9 @@ export default withMiddlewares({
         (!contentType.includes("application/json") &&
           !contentType.includes("application/x-protobuf"))
       ) {
-        return res.status(400).json({ error: "Invalid content type" });
+        logger.error(`Invalid content type: ${contentType}`);
+        res.status(400);
+        return { error: "Invalid content type" };
       }
       if (contentType.includes("application/x-protobuf")) {
         try {
@@ -74,9 +99,8 @@ export default withMiddlewares({
             ).resourceSpans;
         } catch (e) {
           logger.error(`Failed to parse OTel Protobuf`, e);
-          return res
-            .status(400)
-            .json({ error: "Failed to parse OTel Protobuf Trace" });
+          res.status(400);
+          return { error: "Failed to parse OTel Protobuf Trace" };
         }
       }
       if (contentType.includes("application/json")) {
@@ -84,43 +108,91 @@ export default withMiddlewares({
           resourceSpans = JSON.parse(body.toString()).resourceSpans;
         } catch (e) {
           logger.error(`Failed to parse OTel JSON`, e);
-          return res
-            .status(400)
-            .json({ error: "Failed to parse OTel JSON Trace" });
+          res.status(400);
+          return { error: "Failed to parse OTel JSON Trace" };
         }
       }
 
       if (!resourceSpans || resourceSpans.length === 0) {
-        return res.status(200).json({});
+        return {};
+      }
+
+      // Warn on oversized OTEL request bodies (16MB threshold)
+      const bodyBytes = body.byteLength;
+      if (bodyBytes > 16 * 1024 * 1024) {
+        let spanCount = 0;
+        for (const rs of resourceSpans) {
+          for (const ss of rs?.scopeSpans ?? []) {
+            spanCount += ss?.spans?.length ?? 0;
+          }
+        }
+        logger.warn("OTEL request body exceeds 16MB", {
+          projectId: auth.scope.projectId,
+          bodyBytes,
+          spanCount,
+        });
+      }
+
+      // Extract SDK headers for write path decision (supports both hyphen and underscore formats)
+      const sdkName = getLangfuseHeader(req.headers, "x-langfuse-sdk-name");
+      const sdkVersion = getLangfuseHeader(
+        req.headers,
+        "x-langfuse-sdk-version",
+      );
+      const ingestionVersion = getLangfuseHeader(
+        req.headers,
+        "x-langfuse-ingestion-version",
+      );
+
+      // Reject unsupported future ingestion versions (> 4)
+      // Lower versions are valid but use dual write (path A)
+      const parsedIngestionVersion = ingestionVersion
+        ? parseInt(ingestionVersion, 10)
+        : undefined;
+      if (
+        parsedIngestionVersion !== undefined &&
+        (isNaN(parsedIngestionVersion) || parsedIngestionVersion > 4)
+      ) {
+        res.status(400);
+        return {
+          error: `Unsupported x-langfuse-ingestion-version: "${ingestionVersion}". Maximum supported: "4".`,
+        };
+      }
+
+      // Extract headers to propagate for ingestion masking
+      const propagatedHeaderNames =
+        env.LANGFUSE_INGESTION_MASKING_PROPAGATED_HEADERS;
+      const propagatedHeaders: Record<string, string> = {};
+      for (const headerName of propagatedHeaderNames) {
+        const value = req.headers[headerName];
+        if (typeof value === "string") {
+          propagatedHeaders[headerName] = value;
+        }
       }
 
       const processor = new OtelIngestionProcessor({
         projectId: auth.scope.projectId,
         publicKey: auth.scope.publicKey,
+        orgId: auth.scope.orgId,
+        propagatedHeaders:
+          Object.keys(propagatedHeaders).length > 0
+            ? propagatedHeaders
+            : undefined,
+        sdkName,
+        sdkVersion,
+        ingestionVersion,
       });
 
-      // At this point, we have the raw OpenTelemetry Span body. Traditionally, we separated this within the web
-      // container into individual traces and observations with the native Langfuse format before passing them into
-      // the processEventBatch function.
-      // To reduce the number of S3 interactions, we upload the full batch to S3 if `LANGFUSE_EXPERIMENT_USE_OTEL_INGESTION_QUEUE`
-      // is set to `true`. The OtelIngestionProcessor logic will then move into the worker container where observations
-      // are handled as-is and traces are being reprocessed as they are being processed today.
-      const projectIdsToUseOtelBatch =
-        env.LANGFUSE_EXPERIMENT_OTEL_INGESTION_QUEUE_PROJECT_IDS?.split(",") ??
-        [];
-      if (
-        env.LANGFUSE_EXPERIMENT_USE_OTEL_INGESTION_QUEUE === "true" ||
-        projectIdsToUseOtelBatch.includes(auth.scope.projectId)
-      ) {
-        return processor.publishToOtelIngestionQueue(resourceSpans);
-      } else {
-        // Create and process OTEL resource spans to ingestion events
-        const events: IngestionEventType[] =
-          await processor.processToIngestionEvents(resourceSpans);
-
-        // We set a delay of 0 for OTel, as we never expect updates.
-        // We also set the source to "otel" which helps us with metric tracking and skipping list calls for S3.
-        return processEventBatch(events, auth, { delay: 0, source: "otel" });
+      // At this point, we have the raw OpenTelemetry Span body. We upload the full batch to S3
+      // and the OtelIngestionProcessor logic will handle processing in the worker container.
+      try {
+        return await processor.publishToOtelIngestionQueue(resourceSpans);
+      } catch (error) {
+        markProjectIngestFailure(auth.scope.projectId, {
+          source: "public_otel_api",
+          reason: "publish_failed",
+        });
+        throw error;
       }
     },
   }),

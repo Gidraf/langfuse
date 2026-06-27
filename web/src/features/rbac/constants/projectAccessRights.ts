@@ -1,6 +1,8 @@
 import { type Role } from "@langfuse/shared/src/db";
 
-const projectScopes = [
+// Exported to silence @typescript-eslint/no-unused-vars v8 warning
+// (used for type extraction via typeof, which is a legitimate pattern)
+export const projectScopes = [
   "projectMembers:read",
   "projectMembers:CUD",
 
@@ -29,6 +31,7 @@ const projectScopes = [
 
   "integrations:CRUD",
 
+  "datasets:read",
   "datasets:CUD",
 
   "prompts:CUD",
@@ -62,6 +65,8 @@ const projectScopes = [
   "llmTools:CUD",
   "llmTools:read",
 
+  "playground:execute",
+
   "comments:CUD",
   "comments:read",
 
@@ -75,6 +80,9 @@ const projectScopes = [
 
   "automations:CUD",
   "automations:read",
+
+  "monitors:read",
+  "monitors:CUD",
 ] as const;
 
 // type string of all Resource:Action, e.g. "members:read"
@@ -97,6 +105,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "scores:CUD",
     "scoreConfigs:CUD",
     "scoreConfigs:read",
+    "datasets:read",
     "datasets:CUD",
     "prompts:CUD",
     "prompts:read",
@@ -117,6 +126,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "llmSchemas:read",
     "llmTools:CUD",
     "llmTools:read",
+    "playground:execute",
     "batchExports:create",
     "batchExports:read",
     "comments:CUD",
@@ -134,6 +144,8 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "TableViewPresets:read",
     "automations:CUD",
     "automations:read",
+    "monitors:read",
+    "monitors:CUD",
   ],
   ADMIN: [
     "project:read",
@@ -150,6 +162,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "scores:CUD",
     "scoreConfigs:CUD",
     "scoreConfigs:read",
+    "datasets:read",
     "datasets:CUD",
     "prompts:CUD",
     "prompts:read",
@@ -170,6 +183,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "llmSchemas:read",
     "llmTools:CUD",
     "llmTools:read",
+    "playground:execute",
     "batchExports:create",
     "batchExports:read",
     "comments:CUD",
@@ -187,6 +201,8 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "TableViewPresets:read",
     "automations:CUD",
     "automations:read",
+    "monitors:read",
+    "monitors:CUD",
   ],
   MEMBER: [
     "project:read",
@@ -198,6 +214,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "scores:CUD",
     "scoreConfigs:CUD",
     "scoreConfigs:read",
+    "datasets:read",
     "datasets:CUD",
     "prompts:CUD",
     "prompts:read",
@@ -210,7 +227,10 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "evalDefaultModel:CUD",
     "llmApiKeys:read",
     "llmSchemas:read",
+    "llmSchemas:CUD",
+    "llmTools:CUD",
     "llmTools:read",
+    "playground:execute",
     "batchExports:create",
     "batchExports:read",
     "comments:CUD",
@@ -225,6 +245,8 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "TableViewPresets:CUD",
     "TableViewPresets:read",
     "automations:read",
+    "monitors:read",
+    "monitors:CUD",
   ],
   VIEWER: [
     "project:read",
@@ -234,6 +256,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "evalJob:read",
     "evalJobExecution:read",
     "evalDefaultModel:read",
+    "datasets:read",
     "llmApiKeys:read",
     "llmSchemas:read",
     "llmTools:read",
@@ -243,6 +266,7 @@ export const projectRoleAccessRights: Record<Role, ProjectScope[]> = {
     "dashboards:read",
     "TableViewPresets:read",
     "automations:read",
+    "monitors:read",
   ],
   NONE: [],
 };

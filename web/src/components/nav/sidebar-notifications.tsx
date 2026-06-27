@@ -6,16 +6,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/card";
-import { useEffect, useState } from "react";
 import { X } from "lucide-react";
 import useLocalStorage from "../useLocalStorage";
 import Link from "next/link";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
-import ProductHuntBadgeLight from "../images/product_hunt_badge_light.svg";
-import ProductHuntBadgeDark from "../images/product_hunt_badge_dark.svg";
-import Image from "next/image";
 
-const NOTIFICATION_TTL_MS = 14 * 24 * 60 * 60 * 1000; // two weeks
+const TWO_WEEKS_MS = 14 * 24 * 60 * 60 * 1000;
 
 type SidebarNotification = {
   id: string; // Add unique ID for each notification
@@ -26,81 +22,54 @@ type SidebarNotification = {
   // defaults to "Learn more" if no linkContent and no linkTitle
   linkTitle?: string;
   linkContent?: React.ReactNode;
+  // Time-to-live in milliseconds from createdAt. Defaults to TWO_WEEKS_MS.
+  ttlMs?: number;
 };
 
-const notifications: SidebarNotification[] = [
+export const notifications: SidebarNotification[] = [
   {
-    id: "python-sdk-v3",
-    title: "New Python SDK v3",
+    id: "lw5-1",
+    title: "Launch Week: Day 1",
     description:
-      "Python SDK V3 offers significant improvements in developer experience, performance, and integrations.",
-    link: "https://langfuse.com/docs/sdk/python/sdk-v3#upgrade-from-v2",
-    linkTitle: "Upgrade to v3",
-    createdAt: "2025-06-27",
-  },
-  {
-    id: "lw3-5",
-    title: "Launch Week #3: Day 5",
-    description: "New OpenTelemetry based Python SDK.",
-    link: "https://langfuse.com/changelog/2025-05-23-otel-based-python-sdk",
+      "Run experiments inside GitHub Actions to test every PR against a Langfuse dataset.",
+    link: "https://langfuse.com/changelog/2026-05-25-experiment-ci-cd-gates",
     linkTitle: "Learn more",
-    createdAt: "2025-05-23",
+    createdAt: "2026-05-25",
   },
   {
-    id: "lw3-4",
-    title: "Launch Week #3: Day 4",
-    description: "Terraform Modules for AWS, Azure and GCP.",
-    link: "https://langfuse.com/changelog/2025-05-22-terraform-modules",
-    linkTitle: "Learn more",
-    createdAt: "2025-05-22",
-  },
-  {
-    id: "lw3-3-producthunt",
-    title: "Launch Week #3: Day 3",
-    createdAt: "2025-05-21",
-    description: (
-      <span>
-        We are launching <strong>Custom Dashboards</strong> on Product Hunt
-        today.
-        <br />
-        Support the launch to help grow the community!
-      </span>
-    ),
-    link: "https://langfuse.com/ph",
-    linkTitle: "Product Hunt",
-    linkContent: (
-      <>
-        <Image
-          src={ProductHuntBadgeDark}
-          alt="Product Hunt"
-          width={160}
-          className="mt-1 hidden dark:block"
-        />
-        <Image
-          src={ProductHuntBadgeLight}
-          alt="Product Hunt"
-          width={160}
-          className="mt-1 dark:hidden"
-        />
-      </>
-    ),
-  },
-  {
-    id: "lw3-2",
-    title: "Launch Week #3: Day 2",
+    id: "lw5-2",
+    title: "Launch Week: Day 2",
     description:
-      "Saved table views let you reopen any filtered table view with one click.",
-    link: "https://langfuse.com/blog/2025-05-19-launch-week-3",
+      "Langfuse agent skill turns Langfuse into a headless platform to evaluate, query and instrument your application.",
+    link: "https://langfuse.com/changelog/2026-05-26-langfuse-agent-skill",
     linkTitle: "Learn more",
-    createdAt: "2025-05-20",
+    createdAt: "2026-05-26",
   },
   {
-    id: "lw3-1",
-    title: "Launch Week #3: Day 1",
-    description: "New full text search for trace and observation input/output.",
-    link: "https://langfuse.com/blog/2025-05-19-launch-week-3",
+    id: "lw5-3",
+    title: "Launch Week: Day 3",
+    description: "Fast full-text search on observation I/O via the UI and API",
+    link: "https://langfuse.com/changelog/2026-05-27-clickhouse-full-text-search-fast-mode",
     linkTitle: "Learn more",
-    createdAt: "2025-05-19",
+    createdAt: "2026-05-27",
+  },
+  {
+    id: "lw5-4",
+    title: "Launch Week: Day 4",
+    description:
+      "Code evaluators let you score observations and experiments with Python/TypeScript checks.",
+    link: "https://langfuse.com/changelog/2026-05-28-code-evaluators",
+    linkTitle: "Learn more",
+    createdAt: "2026-05-28",
+  },
+  {
+    id: "lw5-5",
+    title: "Launch Week: Day 5",
+    description:
+      "Langfuse MCP now covers observations, metrics, scores, datasets, comments, and more.",
+    link: "https://langfuse.com/changelog/2026-05-29-mcp-update",
+    linkTitle: "Learn more",
+    createdAt: "2026-05-29",
   },
   {
     id: "github-star",
@@ -112,7 +81,7 @@ const notifications: SidebarNotification[] = [
       // eslint-disable-next-line @next/next/no-img-element
       <img
         alt="Langfuse GitHub stars"
-        src="https://img.shields.io/github/stars/langfuse/langfuse?label=langfuse&amp;style=social"
+        src="https://img.shields.io/github/stars/langfuse/langfuse?label=langfuse&style=social"
       />
     ),
   },
@@ -122,9 +91,6 @@ const STORAGE_KEY = "dismissed-sidebar-notifications";
 
 export function SidebarNotifications() {
   const capture = usePostHogClientCapture();
-  const [currentNotificationIndex, setCurrentNotificationIndex] = useState<
-    number | null
-  >(null);
 
   const [dismissedNotifications, setDismissedNotifications] = useLocalStorage<
     string[]
@@ -133,81 +99,115 @@ export function SidebarNotifications() {
   const isExpired = (notif: SidebarNotification) => {
     if (!notif.createdAt) return false;
     const created = new Date(notif.createdAt).getTime();
-    return Date.now() > created + NOTIFICATION_TTL_MS;
+    const ttl = notif.ttlMs ?? TWO_WEEKS_MS;
+    return Date.now() > created + ttl;
   };
-
-  // Find the oldest non-dismissed notification on mount or when dismissed list changes
-  useEffect(() => {
-    const firstAvailableIndex = notifications.findIndex(
-      (notif) =>
-        !dismissedNotifications.includes(notif.id) && !isExpired(notif),
-    );
-
-    setCurrentNotificationIndex(
-      firstAvailableIndex === -1 ? null : firstAvailableIndex,
-    );
-  }, [dismissedNotifications]);
 
   const dismissNotification = (id: string) => {
     setDismissedNotifications([...dismissedNotifications, id]);
   };
 
-  if (currentNotificationIndex === null) {
+  const activeNotifications = notifications.filter(
+    (notif) => !dismissedNotifications.includes(notif.id) && !isExpired(notif),
+  );
+
+  if (activeNotifications.length === 0) {
     return null;
   }
 
-  const currentNotification = notifications[currentNotificationIndex];
+  const MAX_STACK = 3;
+  const visibleNotifications = activeNotifications.slice(0, MAX_STACK);
+  const frontNotification = visibleNotifications[0];
+  const backCount = visibleNotifications.length - 1;
+  const peekOffset = 8;
+  const peekScaleStep = 0.05;
+  const extraBottomPadding = backCount * peekOffset + 2;
 
   return (
-    <Card className="relative max-h-60 overflow-hidden rounded-md bg-opacity-50 shadow-none group-data-[collapsible=icon]:hidden">
-      <Button
-        variant="ghost"
-        size="sm"
-        className="absolute right-2 top-2 h-6 w-6 p-0"
-        onClick={() => {
-          capture("notification:dismiss_notification", {
-            notification_id: currentNotification.id,
-          });
-          dismissNotification(currentNotification.id);
-        }}
-        title="Dismiss"
-      >
-        <X className="h-4 w-4" />
-      </Button>
-      <CardHeader className="p-4 pb-0">
-        <CardTitle className="text-sm">{currentNotification.title}</CardTitle>
-        <CardDescription>{currentNotification.description}</CardDescription>
-      </CardHeader>
-      <CardContent className="p-4 pt-2">
-        {currentNotification.link &&
-          (currentNotification.linkContent ? (
-            <Link
-              href={currentNotification.link}
-              target="_blank"
-              onClick={() => {
-                capture("notification:click_link", {
-                  notification_id: currentNotification.id,
-                });
+    <div
+      className="group-data-[collapsible=icon]:hidden"
+      style={{ paddingBottom: extraBottomPadding }}
+    >
+      <div className="relative">
+        {Array.from({ length: backCount }).map((_, i) => {
+          const index = i + 1;
+          return (
+            <Card
+              key={`stack-${index}`}
+              aria-hidden
+              className="bg-card pointer-events-none absolute inset-0 rounded-md shadow-none"
+              style={{
+                transform: `translateY(${index * peekOffset}px) scaleX(${
+                  1 - index * peekScaleStep
+                })`,
+                transformOrigin: "top center",
+                zIndex: visibleNotifications.length - index,
               }}
-            >
-              {currentNotification.linkContent}
-            </Link>
-          ) : (
-            <Button variant="secondary" size="sm" asChild>
-              <Link
-                href={currentNotification.link}
-                target="_blank"
-                onClick={() => {
-                  capture("notification:click_link", {
-                    notification_id: currentNotification.id,
-                  });
-                }}
-              >
-                {currentNotification.linkTitle ?? "Learn more"} &rarr;
-              </Link>
-            </Button>
-          ))}
-      </CardContent>
-    </Card>
+            />
+          );
+        })}
+        <Card
+          key={frontNotification.id}
+          className="bg-card relative max-h-60 overflow-hidden rounded-md shadow-none"
+          style={{ zIndex: visibleNotifications.length }}
+        >
+          <Button
+            variant="ghost"
+            size="sm"
+            className="absolute top-2.5 right-1.5 h-5 w-5 p-0"
+            onClick={() => {
+              capture("notification:dismiss_notification", {
+                notification_id: frontNotification.id,
+              });
+              dismissNotification(frontNotification.id);
+            }}
+            title="Dismiss"
+          >
+            <X className="h-3.5 w-3.5" />
+          </Button>
+          <CardHeader className="px-3 pt-2.5 pr-6 pb-0">
+            <CardTitle className="text-sm">{frontNotification.title}</CardTitle>
+            <CardDescription className="mt-1">
+              {frontNotification.description}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="px-3 pt-1.5 pb-2.5">
+            {frontNotification.link &&
+              (frontNotification.linkContent ? (
+                <Link
+                  href={frontNotification.link}
+                  target="_blank"
+                  onClick={() => {
+                    capture("notification:click_link", {
+                      notification_id: frontNotification.id,
+                    });
+                  }}
+                >
+                  {frontNotification.linkContent}
+                </Link>
+              ) : (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  className="w-full"
+                  asChild
+                >
+                  <Link
+                    href={frontNotification.link}
+                    target="_blank"
+                    onClick={() => {
+                      capture("notification:click_link", {
+                        notification_id: frontNotification.id,
+                      });
+                    }}
+                  >
+                    {frontNotification.linkTitle ?? "Learn more"} &rarr;
+                  </Link>
+                </Button>
+              ))}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
   );
 }

@@ -1,6 +1,7 @@
-import { z } from "zod/v4";
+import { z } from "zod";
 
 import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { assertLegacyBlobExportSourceAllowed } from "@/src/features/blobstorage-integration/server/assertLegacyBlobExportSourceAllowed";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import {
   createTRPCRouter,
@@ -10,6 +11,7 @@ import { decrypt, encrypt } from "@langfuse/shared/encryption";
 import { posthogIntegrationFormSchema } from "@/src/features/posthog-integration/types";
 import { TRPCError } from "@trpc/server";
 import { env } from "@/src/env.mjs";
+import { validateWebhookURL } from "@langfuse/shared/src/server";
 
 export const posthogIntegrationRouter = createTRPCRouter({
   get: protectedProjectProcedure
@@ -31,10 +33,11 @@ export const posthogIntegrationRouter = createTRPCRouter({
           return null;
         }
 
-        const { encryptedPosthogApiKey, ...config } = dbConfig;
+        const { encryptedPosthogApiKey, exportSource, ...config } = dbConfig;
 
         return {
           ...config,
+          exportSource,
           posthogApiKey: decrypt(encryptedPosthogApiKey),
         };
       } catch (e) {
@@ -67,6 +70,34 @@ export const posthogIntegrationRouter = createTRPCRouter({
           });
         }
       }
+
+      // Validate PostHog hostname to prevent SSRF attacks
+      try {
+        await validateWebhookURL(input.posthogHostname);
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message:
+            error instanceof Error
+              ? `Invalid PostHog hostname: ${error.message}`
+              : "Invalid PostHog hostname",
+        });
+      }
+
+      // Post-cutoff Cloud projects may not select a legacy export source.
+      // Mirrors the blob-storage gate (LFE-9688); shares the same helper.
+      if (input.exportSource) {
+        const project = await ctx.prisma.project.findUniqueOrThrow({
+          where: { id: input.projectId },
+          select: { createdAt: true },
+        });
+        assertLegacyBlobExportSourceAllowed({
+          project,
+          nextInternalExportSource: input.exportSource,
+          isCloud: Boolean(env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION),
+        });
+      }
+
       await auditLog({
         session: ctx.session,
         action: "update",
@@ -86,11 +117,13 @@ export const posthogIntegrationRouter = createTRPCRouter({
           posthogHostName: config.posthogHostname,
           encryptedPosthogApiKey,
           enabled: config.enabled,
+          exportSource: config.exportSource,
         },
         update: {
           encryptedPosthogApiKey,
           posthogHostName: config.posthogHostname,
           enabled: config.enabled,
+          exportSource: config.exportSource,
         },
       });
     }),

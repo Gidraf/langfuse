@@ -1,15 +1,21 @@
-import { StringParam, useQueryParam, withDefault } from "use-query-params";
-import { PublishTraceSwitch } from "@/src/components/publish-object-switch";
 import { DetailPageNav } from "@/src/features/navigate-detail-pages/DetailPageNav";
 import { useRouter } from "next/router";
-import { api } from "@/src/utils/api";
-import { StarTraceDetailsToggle } from "@/src/components/star-toggle";
 import { ErrorPage } from "@/src/components/error-page";
-import { DeleteTraceButton } from "@/src/components/deleteButton";
+import { TraceDetailActions } from "@/src/components/trace/TraceDetailActions";
+import { useTraceDetailData } from "@/src/components/trace/useTraceDetailData";
 import Page from "@/src/components/layouts/page";
-import { Trace } from "@/src/components/trace";
-import { TagTraceDetailsPopover } from "@/src/features/tag/components/TagTraceDetailsPopover";
+import {
+  TraceDetailBody,
+  traceDetailTitle,
+} from "@/src/components/trace/TraceDetailBody";
+import { useSession } from "next-auth/react";
 import { useIsAuthenticatedAndProjectMember } from "@/src/features/auth/hooks";
+import { Button } from "@/src/components/ui/button";
+import Link from "next/link";
+import { stripBasePath } from "@/src/utils/redirect";
+import { Badge } from "@/src/components/ui/badge";
+import { showErrorToast } from "@/src/features/notifications/showErrorToast";
+import { useEffect } from "react";
 
 export function TracePage({
   traceId,
@@ -19,78 +25,88 @@ export function TracePage({
   timestamp?: Date;
 }) {
   const router = useRouter();
+  const session = useSession();
+  const routeProjectId = (router.query.projectId as string) ?? "";
 
-  const trace = api.traces.byIdWithObservationsAndScores.useQuery(
-    {
-      traceId,
-      timestamp,
-      projectId: router.query.projectId as string,
-    },
-    {
-      retry(failureCount, error) {
-        if (
-          error.data?.code === "UNAUTHORIZED" ||
-          error.data?.code === "NOT_FOUND"
-        )
-          return false;
-        return failureCount < 3;
-      },
-    },
+  // Shared, beta-aware fetch (same hook the peek uses).
+  const trace = useTraceDetailData({
+    projectId: routeProjectId,
+    traceId,
+    timestamp,
+  });
+
+  const projectIdForAccessCheck = trace.data?.projectId ?? routeProjectId;
+  const hasProjectAccess = useIsAuthenticatedAndProjectMember(
+    projectIdForAccessCheck,
   );
 
-  const isAuthenticatedAndProjectMember = useIsAuthenticatedAndProjectMember(
-    trace.data?.projectId ?? "",
-  );
+  useEffect(() => {
+    if (trace.cutoffObservationsAfterMaxCount) {
+      showErrorToast(
+        "Trace truncated",
+        "This trace has too many observations for the detail view. Only a subset is shown.",
+        "WARNING",
+      );
+    }
+  }, [trace.cutoffObservationsAfterMaxCount]);
 
-  const traceFilterOptions = api.traces.filterOptions.useQuery(
-    {
-      projectId: trace.data?.projectId as string,
-    },
-    {
-      trpc: {
-        context: {
-          skipBatch: true,
-        },
-      },
-      enabled: !!trace.data?.projectId && isAuthenticatedAndProjectMember,
-      refetchOnMount: false,
-      refetchOnWindowFocus: false,
-      refetchOnReconnect: false,
-      staleTime: Infinity,
-    },
-  );
-
-  const filterOptionTags = traceFilterOptions.data?.tags ?? [];
-  const allTags = filterOptionTags.map((t) => t.value);
-
-  const [selectedTab, setSelectedTab] = useQueryParam(
-    "display",
-    withDefault(StringParam, "details"),
-  );
-
-  if (trace.error?.data?.code === "UNAUTHORIZED")
+  if (trace.isUnauthorized)
     return <ErrorPage message="You do not have access to this trace." />;
 
-  if (trace.error?.data?.code === "NOT_FOUND")
+  if (trace.isNotFound)
     return (
       <ErrorPage
         title="Trace not found"
         message="The trace is either still being processed or has been deleted."
         additionalButton={{
           label: "Retry",
-          onClick: () => void window.location.reload(),
+          onClick: () => window.location.reload(),
         }}
       />
     );
 
   if (!trace.data) return <div className="p-3">Loading...</div>;
 
+  const isSharedTrace = trace.data.public;
+  const showPublicIndicators = isSharedTrace && !hasProjectAccess;
+  const encodedTargetPath = encodeURIComponent(
+    stripBasePath(router.asPath || "/"),
+  );
+  const leadingControl = showPublicIndicators ? (
+    session.status === "authenticated" ? (
+      <Button
+        asChild
+        size="sm"
+        variant="outline"
+        title="Back to Langfuse"
+        className="px-3"
+      >
+        <Link href="/">Langfuse</Link>
+      </Button>
+    ) : (
+      <Button
+        asChild
+        size="sm"
+        variant="default"
+        title="Sign in to Langfuse"
+        className="px-3"
+      >
+        <Link href={`/auth/sign-in?targetPath=${encodedTargetPath}`}>
+          Sign in
+        </Link>
+      </Button>
+    )
+  ) : undefined;
+  const sharedBadge = showPublicIndicators ? (
+    <Badge variant="outline" className="text-xs font-medium">
+      Public
+    </Badge>
+  ) : undefined;
+
   return (
     <Page
       headerProps={{
-        title: trace.data.name
-          ? `${trace.data.name}: ${trace.data.id}`
-          : trace.data.id,
+        title: traceDetailTitle(trace.data) ?? trace.data.id,
         itemType: "TRACE",
         breadcrumb: [
           {
@@ -98,34 +114,9 @@ export function TracePage({
             href: `/project/${router.query.projectId as string}/traces`,
           },
         ],
-        actionButtonsLeft: (
-          <div className="ml-1 flex items-center gap-1">
-            <div className="max-h-[10dvh] overflow-y-auto">
-              <TagTraceDetailsPopover
-                tags={trace.data.tags}
-                availableTags={allTags}
-                traceId={trace.data.id}
-                projectId={trace.data.projectId}
-                className="flex-wrap"
-                key={trace.data.id}
-              />
-            </div>
-            <div className="flex items-center gap-0">
-              <StarTraceDetailsToggle
-                traceId={trace.data.id}
-                projectId={trace.data.projectId}
-                value={trace.data.bookmarked}
-                size="icon-xs"
-              />
-              <PublishTraceSwitch
-                traceId={trace.data.id}
-                projectId={trace.data.projectId}
-                isPublic={trace.data.public}
-                size="icon-xs"
-              />
-            </div>
-          </div>
-        ),
+        showSidebarTrigger: !showPublicIndicators,
+        leadingControl,
+        breadcrumbBadges: sharedBadge,
         actionButtonsRight: (
           <>
             <DetailPageNav
@@ -136,38 +127,41 @@ export function TracePage({
                   ...(typeof view === "string" ? { view } : {}),
                   ...(typeof display === "string" ? { display } : {}),
                 });
-                const queryParamString = Boolean(queryParams.size)
-                  ? `?${queryParams.toString()}`
-                  : "";
-
                 const timestamp =
                   entry.params && entry.params.timestamp
                     ? encodeURIComponent(entry.params.timestamp)
                     : undefined;
 
-                return `/project/${projectId as string}/traces/${entry.id}${queryParamString}${timestamp ? `?timestamp=${timestamp}` : ""}`;
+                if (timestamp) {
+                  queryParams.set("timestamp", timestamp);
+                }
+
+                const finalQueryString = queryParams.size
+                  ? `?${queryParams.toString()}`
+                  : "";
+
+                return `/project/${projectId as string}/traces/${entry.id}${finalQueryString}`;
               }}
               listKey="traces"
+              size="sm"
             />
-            <DeleteTraceButton
-              itemId={traceId}
+            <TraceDetailActions
+              traceId={trace.data.id}
               projectId={trace.data.projectId}
-              redirectUrl={`/project/${router.query.projectId as string}/traces`}
-              deleteConfirmation={trace.data.name ?? ""}
-              icon
+              bookmarked={trace.data.bookmarked}
+              isPublic={trace.data.public}
+              name={trace.data.name}
+              timestamp={timestamp}
+              deleteRedirectUrl={`/project/${router.query.projectId as string}/traces`}
             />
           </>
         ),
       }}
     >
       <div className="flex max-h-full min-h-0 flex-1 overflow-hidden">
-        <Trace
+        <TraceDetailBody
           trace={trace.data}
-          scores={trace.data.scores}
-          projectId={trace.data.projectId}
-          observations={trace.data.observations}
-          selectedTab={selectedTab}
-          setSelectedTab={setSelectedTab}
+          context={router.query.peek !== undefined ? "peek" : "fullscreen"}
         />
       </div>
     </Page>

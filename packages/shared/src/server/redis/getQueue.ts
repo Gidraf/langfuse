@@ -2,14 +2,16 @@ import { Queue } from "bullmq";
 import { QueueName } from "../queues";
 import { BatchExportQueue } from "./batchExport";
 import { CloudUsageMeteringQueue } from "./cloudUsageMeteringQueue";
+import { CloudSpendAlertQueue } from "./cloudSpendAlertQueue";
+import { CloudFreeTierUsageThresholdQueue } from "./cloudFreeTierUsageThresholdQueue";
 import { DatasetRunItemUpsertQueue } from "./datasetRunItemUpsert";
-import { EvalExecutionQueue } from "./evalExecutionQueue";
 import { ExperimentCreateQueue } from "./experimentCreateQueue";
-import { SecondaryIngestionQueue } from "./ingestionQueue";
 import { TraceDeleteQueue } from "./traceDelete";
 import { ProjectDeleteQueue } from "./projectDelete";
 import { PostHogIntegrationQueue } from "./postHogIntegrationQueue";
 import { PostHogIntegrationProcessingQueue } from "./postHogIntegrationProcessingQueue";
+import { MixpanelIntegrationQueue } from "./mixpanelIntegrationQueue";
+import { MixpanelIntegrationProcessingQueue } from "./mixpanelIntegrationProcessingQueue";
 import { BlobStorageIntegrationQueue } from "./blobStorageIntegrationQueue";
 import { BlobStorageIntegrationProcessingQueue } from "./blobStorageIntegrationProcessingQueue";
 import { CoreDataS3ExportQueue } from "./coreDataS3ExportQueue";
@@ -23,15 +25,24 @@ import { DeadLetterRetryQueue } from "./dlqRetryQueue";
 import { WebhookQueue } from "./webhookQueue";
 import { EntityChangeQueue } from "./entityChangeQueue";
 import { DatasetDeleteQueue } from "./datasetDelete";
+import { EventPropagationQueue } from "./eventPropagationQueue";
+import { NotificationQueue } from "./notificationQueue";
+import { MonitorQueue } from "./monitorQueue";
 
-// IngestionQueue, OtelIngestionQueue, and TraceUpsert are sharded and require a sharding key
-// Use IngestionQueue.getInstance({ shardName: queueName }) or TraceUpsertQueue.getInstance({ shardName: queueName }) directly instead
+// Sharded queues require a sharding key.
+// Use the queue class directly, for example IngestionQueue.getInstance({ shardingKey }).
 export function getQueue(
   queueName: Exclude<
     QueueName,
     | QueueName.IngestionQueue
+    | QueueName.IngestionSecondaryQueue
+    | QueueName.EvaluationExecution
+    | QueueName.EvaluationExecutionSecondaryQueue
+    | QueueName.LLMAsJudgeExecution
+    | QueueName.CodeEvalExecution
     | QueueName.TraceUpsert
     | QueueName.OtelIngestionQueue
+    | QueueName.OtelIngestionSecondaryQueue
   >,
 ): Queue | null {
   switch (queueName) {
@@ -39,12 +50,14 @@ export function getQueue(
       return BatchExportQueue.getInstance();
     case QueueName.CloudUsageMeteringQueue:
       return CloudUsageMeteringQueue.getInstance();
+    case QueueName.CloudSpendAlertQueue:
+      return CloudSpendAlertQueue.getInstance();
+    case QueueName.CloudFreeTierUsageThresholdQueue:
+      return CloudFreeTierUsageThresholdQueue.getInstance();
     case QueueName.DatasetRunItemUpsert:
       return DatasetRunItemUpsertQueue.getInstance();
     case QueueName.DatasetDelete:
       return DatasetDeleteQueue.getInstance();
-    case QueueName.EvaluationExecution:
-      return EvalExecutionQueue.getInstance();
     case QueueName.ExperimentCreate:
       return ExperimentCreateQueue.getInstance();
     case QueueName.TraceDelete:
@@ -55,12 +68,14 @@ export function getQueue(
       return PostHogIntegrationQueue.getInstance();
     case QueueName.PostHogIntegrationProcessingQueue:
       return PostHogIntegrationProcessingQueue.getInstance();
+    case QueueName.MixpanelIntegrationQueue:
+      return MixpanelIntegrationQueue.getInstance();
+    case QueueName.MixpanelIntegrationProcessingQueue:
+      return MixpanelIntegrationProcessingQueue.getInstance();
     case QueueName.BlobStorageIntegrationQueue:
       return BlobStorageIntegrationQueue.getInstance();
     case QueueName.BlobStorageIntegrationProcessingQueue:
       return BlobStorageIntegrationProcessingQueue.getInstance();
-    case QueueName.IngestionSecondaryQueue:
-      return SecondaryIngestionQueue.getInstance();
     case QueueName.CoreDataS3ExportQueue:
       return CoreDataS3ExportQueue.getInstance();
     case QueueName.MeteringDataPostgresExportQueue:
@@ -81,9 +96,14 @@ export function getQueue(
       return WebhookQueue.getInstance();
     case QueueName.EntityChangeQueue:
       return EntityChangeQueue.getInstance();
+    case QueueName.EventPropagationQueue:
+      return EventPropagationQueue.getInstance();
+    case QueueName.NotificationQueue:
+      return NotificationQueue.getInstance();
+    case QueueName.MonitorQueue:
+      return MonitorQueue.getInstance();
     default: {
-      // eslint-disable-next-line no-case-declarations, no-unused-vars
-      const exhaustiveCheckDefault: never = queueName;
+      const _exhaustiveCheckDefault: never = queueName;
       throw new Error(`Queue ${queueName} not found`);
     }
   }

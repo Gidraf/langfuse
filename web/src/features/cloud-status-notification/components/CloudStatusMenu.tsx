@@ -1,10 +1,10 @@
 import { api } from "@/src/utils/api";
-import { env } from "@/src/env.mjs";
-import { cn } from "@/src/utils/tailwind";
 import Link from "next/link";
 import { SidebarMenuButton } from "@/src/components/ui/sidebar";
+import { useLangfuseCloudRegion } from "@/src/features/organizations/hooks";
 
 export function CloudStatusMenu() {
+  const { isLangfuseCloud } = useLangfuseCloudRegion();
   const { data, isLoading } = api.cloudStatus.getStatus.useQuery(undefined, {
     refetchOnMount: false,
     refetchOnReconnect: false,
@@ -12,11 +12,11 @@ export function CloudStatusMenu() {
     // Refresh status data every 5 minutes, keep response cached for 5 minutes
     refetchInterval: 5 * 60 * 1000,
     staleTime: 5 * 60 * 1000,
-    enabled: !!env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION,
+    enabled: !!isLangfuseCloud,
   });
 
   // Skip component rendering if not running on Langfuse Cloud
-  if (!env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION) {
+  if (!isLangfuseCloud) {
     return null;
   }
 
@@ -33,16 +33,8 @@ export function CloudStatusMenu() {
         rel="noopener noreferrer"
       >
         <div className="relative mx-1 flex h-2 w-2 items-center justify-center">
-          <span
-            className={cn(
-              "absolute inline-flex h-2 w-2 animate-ping rounded-full bg-yellow-500 opacity-75",
-            )}
-          ></span>
-          <span
-            className={cn(
-              "relative inline-flex h-2 w-2 rounded-full bg-yellow-600",
-            )}
-          ></span>
+          <span className="absolute inline-flex h-2 w-2 animate-ping rounded-full bg-yellow-500 opacity-75"></span>
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-yellow-600"></span>
         </div>
         Status
       </Link>

@@ -3,40 +3,50 @@ import {
   FilterCondition,
   TimeFilter,
   BatchExportQueryType,
-  ScoreDomain,
-  evalDatasetFormFilterCols,
   OrderByState,
   TracingSearchType,
+  isPresent,
+  type ScoreDataTypeType,
 } from "@langfuse/shared";
 import { prisma } from "@langfuse/shared/src/db";
 import {
   FullObservationsWithScores,
   DatabaseReadStream,
   getScoresUiTable,
+  getScoresUiTableFromEvents,
+  getTraceMetadataByIdsFromEvents,
   getPublicSessionsFilter,
   getSessionsWithMetrics,
+  getSessionsWithMetricsFromEvents,
   getDistinctScoreNames,
   getObservationsTableWithModelData,
   getScoresForObservations,
   getTracesTable,
   getTracesTableMetrics,
-  getTracesByIds,
-  getScoresForTraces,
-  tableColumnsToSqlFilterAndPrefix,
   getTraceIdentifiers,
   getDatasetRunItemsCh,
+  getTracesByIds,
+  getScoresForTraces,
+  getDatasetItems,
 } from "@langfuse/shared/src/server";
 import Decimal from "decimal.js";
 import { env } from "../../env";
-import { BatchExportTracesRow, BatchExportSessionsRow } from "./types";
+import {
+  BatchExportTracesRow,
+  BatchExportSessionsRow,
+  BatchExportEventsRow,
+} from "./types";
+import { fetchCommentsForExport } from "./fetchCommentsForExport";
 
 const tableNameToTimeFilterColumn: Record<BatchTableNames, string> = {
   scores: "timestamp",
   sessions: "createdAt",
   traces: "timestamp",
   observations: "startTime",
+  events: "startTime",
+  datasets: "createdAt",
   dataset_run_items: "createdAt",
-  dataset_items: "createdAt",
+  dataset_items: "createdAt", // TODO: flip to validFrom once we write in new format
   audit_logs: "createdAt",
 };
 const tableNameToTimeFilterColumnCh: Record<BatchTableNames, string> = {
@@ -44,6 +54,8 @@ const tableNameToTimeFilterColumnCh: Record<BatchTableNames, string> = {
   sessions: "createdAt",
   traces: "timestamp",
   observations: "startTime",
+  events: "startTime",
+  datasets: "createdAt",
   dataset_run_items: "createdAt",
   dataset_items: "createdAt",
   audit_logs: "createdAt",
@@ -53,13 +65,16 @@ const isGenerationTimestampFilter = (
 ): filter is TimeFilter => {
   return filter.column === "Start Time" && filter.type === "datetime";
 };
-const isTraceTimestampFilter = (
+export const isTraceTimestampFilter = (
   filter: FilterCondition,
 ): filter is TimeFilter => {
   return filter.column === "Timestamp" && filter.type === "datetime";
 };
-const getChunkWithFlattenedScores = <
-  T extends BatchExportTracesRow[] | FullObservationsWithScores,
+export const getChunkWithFlattenedScores = <
+  T extends
+    | BatchExportTracesRow[]
+    | FullObservationsWithScores
+    | BatchExportEventsRow[],
 >(
   chunk: T,
   emptyScoreColumns: Record<string, null>,
@@ -75,9 +90,9 @@ const getChunkWithFlattenedScores = <
           ...acc,
           [key]: value,
         };
-      } else {
-        return acc;
       }
+
+      return acc;
     }, emptyScoreColumns);
     return {
       ...data,
@@ -86,7 +101,50 @@ const getChunkWithFlattenedScores = <
   });
 };
 
-export const getDatabaseReadStream = async ({
+// Events-backed replacement for the legacy getScoresUiTable traces JOIN:
+// loads score rows without trace enrichment, then fills traceName /
+// traceUserId / traceTags from the events table for the page's trace ids.
+const getScoresWithTraceMetadataFromEvents = async (props: {
+  projectId: string;
+  filter: FilterCondition[];
+  orderBy: OrderByState;
+  limit: number;
+  offset: number;
+  clickhouseConfigs: Parameters<
+    typeof getScoresUiTableFromEvents
+  >[0]["clickhouseConfigs"];
+}) => {
+  const scores = await getScoresUiTableFromEvents({
+    ...props,
+    excludeMetadata: false,
+  });
+
+  const traceMetadata = await getTraceMetadataByIdsFromEvents({
+    projectId: props.projectId,
+    traceIds: [
+      ...new Set(
+        scores
+          .map((score) => score.traceId)
+          .filter((traceId): traceId is string => Boolean(traceId)),
+      ),
+    ],
+    clickhouseConfigs: props.clickhouseConfigs,
+  });
+
+  return scores.map((score) => {
+    const trace = traceMetadata.find((t) => t.id === score.traceId);
+    // `?? null` (not `|| null`): preserve explicit empty strings/arrays so
+    // rows serialize the same as the legacy traces-JOIN export path.
+    return {
+      ...score,
+      traceName: trace?.name ?? null,
+      traceUserId: trace?.user_id ?? null,
+      traceTags: trace?.tags ?? null,
+    };
+  });
+};
+
+export const getDatabaseReadStreamPaginated = async ({
   projectId,
   tableName,
   filter,
@@ -94,6 +152,7 @@ export const getDatabaseReadStream = async ({
   cutoffCreatedAt,
   searchQuery,
   searchType,
+  useEventsTable,
   rowLimit = env.BATCH_EXPORT_ROW_LIMIT,
 }: {
   projectId: string;
@@ -118,23 +177,44 @@ export const getDatabaseReadStream = async ({
   };
 
   const clickhouseConfigs = {
-    request_timeout: 120_000,
+    request_timeout: 180_000,
+    clickhouse_settings: {
+      // Increase HTTP timeouts to prevent Code 209 errors during slow blob storage uploads
+      // See: https://github.com/ClickHouse/ClickHouse/issues/64731
+      http_send_timeout: 300,
+      http_receive_timeout: 300,
+    },
   };
 
   switch (tableName) {
     case "scores": {
       return new DatabaseReadStream<unknown>(
         async (pageSize: number, offset: number) => {
-          const scores = await getScoresUiTable({
-            projectId,
-            filter: filter
-              ? [...filter, createdAtCutoffFilter]
-              : [createdAtCutoffFilter],
-            orderBy,
-            limit: pageSize,
-            offset,
-            clickhouseConfigs,
-          });
+          const scoresFilter = filter
+            ? [...filter, createdAtCutoffFilter]
+            : [createdAtCutoffFilter];
+
+          // v4-enabled users (snapshotted as useEventsTable at dispatch) read
+          // scores without the legacy traces JOIN; trace metadata (name,
+          // userId, tags) is loaded from the events table instead, mirroring
+          // the scores UI (scores.allFromEvents + scores.metricsFromEvents).
+          const scores = useEventsTable
+            ? await getScoresWithTraceMetadataFromEvents({
+                projectId,
+                filter: scoresFilter,
+                orderBy,
+                limit: pageSize,
+                offset,
+                clickhouseConfigs,
+              })
+            : await getScoresUiTable({
+                projectId,
+                filter: scoresFilter,
+                orderBy,
+                limit: pageSize,
+                offset,
+                clickhouseConfigs,
+              });
 
           // Get author user info for scores
           // Only users that have valid project write access may write scores
@@ -193,14 +273,27 @@ export const getDatabaseReadStream = async ({
             projectId,
             finalFilter ?? [],
           );
-          const sessions = await getSessionsWithMetrics({
-            projectId: projectId,
-            filter: sessionsFilter,
-            orderBy: orderBy,
-            limit: pageSize,
-            page: Math.floor(offset / pageSize),
-            clickhouseConfigs,
-          });
+          // v4-enabled users (snapshotted as useEventsTable at dispatch) read
+          // sessions from the ClickHouse events table. Both readers apply the
+          // same filter (incl. the createdAt cutoff) and clickhouseConfigs, and
+          // expose the same field names, so the row mapping below is shared.
+          const sessions = useEventsTable
+            ? await getSessionsWithMetricsFromEvents({
+                projectId: projectId,
+                filter: sessionsFilter,
+                orderBy: orderBy,
+                limit: pageSize,
+                page: Math.floor(offset / pageSize),
+                clickhouseConfigs,
+              })
+            : await getSessionsWithMetrics({
+                projectId: projectId,
+                filter: sessionsFilter,
+                orderBy: orderBy,
+                limit: pageSize,
+                page: Math.floor(offset / pageSize),
+                clickhouseConfigs,
+              });
 
           const prismaSessionInfo = await prisma.traceSession.findMany({
             where: {
@@ -215,7 +308,7 @@ export const getDatabaseReadStream = async ({
               public: true,
             },
           });
-          return sessions.map((s) => {
+          const rows = sessions.map((s) => {
             const row: BatchExportSessionsRow = {
               id: s.session_id,
               userIds: s.user_ids,
@@ -237,6 +330,19 @@ export const getDatabaseReadStream = async ({
             };
             return row;
           });
+
+          // Fetch comments for all sessions in this page
+          const sessionComments = await fetchCommentsForExport(
+            projectId,
+            "SESSION",
+            sessions.map((s) => s.session_id),
+          );
+
+          // Add comments to each session
+          return rows.map((row) => ({
+            ...row,
+            comments: sessionComments.get(row.id) ?? [],
+          }));
         },
         env.BATCH_EXPORT_PAGE_SIZE,
         rowLimit,
@@ -294,7 +400,23 @@ export const getDatabaseReadStream = async ({
             };
           });
 
-          return getChunkWithFlattenedScores(chunk, emptyScoreColumns);
+          // Fetch comments for all observations in this page
+          const observationComments = await fetchCommentsForExport(
+            projectId,
+            "OBSERVATION",
+            generations.map((g) => g.id),
+          );
+
+          // Add comments to flattened chunk
+          const flattenedChunk = getChunkWithFlattenedScores(
+            chunk,
+            emptyScoreColumns,
+          );
+
+          return flattenedChunk.map((obs: any) => ({
+            ...obs,
+            comments: observationComments.get(obs.id) ?? [],
+          }));
         },
         env.BATCH_EXPORT_PAGE_SIZE,
         rowLimit,
@@ -353,9 +475,7 @@ export const getDatabaseReadStream = async ({
                 (min, t) => (!min || t.timestamp < min ? t.timestamp : min),
                 undefined as Date | undefined,
               ),
-              {
-                request_timeout: 120_000,
-              },
+              clickhouseConfigs,
             ),
           ]);
 
@@ -403,7 +523,23 @@ export const getDatabaseReadStream = async ({
             };
           });
 
-          return getChunkWithFlattenedScores(chunk, emptyScoreColumns);
+          // Fetch comments for all traces in this page
+          const traceComments = await fetchCommentsForExport(
+            projectId,
+            "TRACE",
+            traces.map((t) => t.id),
+          );
+
+          // Add comments to each trace
+          const chunkWithComments = chunk.map((trace) => ({
+            ...trace,
+            comments: traceComments.get(trace.id) ?? [],
+          }));
+
+          return getChunkWithFlattenedScores(
+            chunkWithComments,
+            emptyScoreColumns,
+          );
         },
         env.BATCH_EXPORT_PAGE_SIZE,
         rowLimit,
@@ -463,71 +599,26 @@ export const getDatabaseReadStream = async ({
     case "dataset_items": {
       return new DatabaseReadStream<unknown>(
         async (pageSize: number, offset: number) => {
-          const condition = tableColumnsToSqlFilterAndPrefix(
-            filter ?? [],
-            evalDatasetFormFilterCols,
-            "dataset_items",
-          );
-
-          const items = await prisma.$queryRaw<
-            Array<{
-              id: string;
-              project_id: string;
-              dataset_id: string;
-              dataset_name: string;
-              status: string;
-              input: unknown;
-              expected_output: unknown;
-              metadata: unknown;
-              source_trace_id: string | null;
-              source_observation_id: string | null;
-              created_at: Date;
-              updated_at: Date;
-            }>
-          >`
-            SELECT 
-              di.id,
-              di.project_id,
-              di.dataset_id,
-              d.name as dataset_name,
-              di.status,
-              di.input,
-              di.expected_output,
-              di.metadata,
-              di.source_trace_id,
-              di.source_observation_id,
-              di.created_at,
-              di.updated_at
-            FROM dataset_items di 
-              JOIN datasets d ON di.dataset_id = d.id AND di.project_id = d.project_id
-            WHERE di.project_id = ${projectId}
-            AND di.created_at < ${cutoffCreatedAt}
-            ${condition}
-            ORDER BY di.created_at DESC
-            LIMIT ${pageSize}
-            OFFSET ${offset}
-          `;
+          const items = await getDatasetItems<true, true>({
+            projectId,
+            filterState: filter
+              ? [...filter, createdAtCutoffFilter]
+              : [createdAtCutoffFilter],
+            includeIO: true,
+            includeDatasetName: true,
+            limit: pageSize,
+            page: Math.floor(offset / pageSize),
+          });
 
           return items.map((item) => ({
-            id: item.id,
-            projectId: item.project_id,
-            datasetId: item.dataset_id,
-            datasetName: item.dataset_name,
-            status: item.status,
-            input: item.input,
-            expectedOutput: item.expected_output,
-            metadata: item.metadata,
-            htmlSourcePath: item.source_trace_id
-              ? `/project/${projectId}/traces/${item.source_trace_id}${
-                  item.source_observation_id
-                    ? `?observation=${item.source_observation_id}`
+            ...item,
+            htmlSourcePath: item.sourceTraceId
+              ? `/project/${projectId}/traces/${item.sourceTraceId}${
+                  item.sourceObservationId
+                    ? `?observation=${item.sourceObservationId}`
                     : ""
                 }`
               : "",
-            sourceTraceId: item.source_trace_id,
-            sourceObservationId: item.source_observation_id,
-            createdAt: item.created_at,
-            updatedAt: item.updated_at,
           }));
         },
         env.BATCH_EXPORT_PAGE_SIZE,
@@ -580,15 +671,22 @@ export const getDatabaseReadStream = async ({
 };
 
 export function prepareScoresForOutput(
-  filteredScores: ScoreDomain[],
+  scores: {
+    name: string;
+    stringValue?: string | null;
+    dataType: ScoreDataTypeType;
+    value: number;
+  }[],
 ): Record<string, string[] | number[]> {
-  return filteredScores.reduce(
+  return scores.reduce(
     (acc, score) => {
       // If this score name already exists in acc, use its existing type
       const existingValues = acc[score.name];
       const newValue =
-        score.dataType === "NUMERIC" ? score.value : score.stringValue;
-      if (!newValue) return acc;
+        score.dataType === "NUMERIC" || score.dataType === "BOOLEAN"
+          ? score.value
+          : score.stringValue;
+      if (!isPresent(newValue)) return acc;
 
       if (!existingValues) {
         // First value determines the type
@@ -644,7 +742,13 @@ export const getTraceIdentifierStream = async (props: {
   };
 
   const clickhouseConfigs = {
-    request_timeout: 120_000,
+    request_timeout: 180_000,
+    clickhouse_settings: {
+      // Increase HTTP timeouts to prevent Code 209 errors during slow blob storage uploads
+      // See: https://github.com/ClickHouse/ClickHouse/issues/64731
+      http_send_timeout: 300,
+      http_receive_timeout: 300,
+    },
   };
 
   return new DatabaseReadStream<TraceIdentifiers>(

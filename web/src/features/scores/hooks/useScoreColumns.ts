@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { api } from "@/src/utils/api";
 import {
-  type ScoreDataType,
+  type ScoreDataTypeType,
   type FilterCondition,
   type ScoreAggregate,
 } from "@langfuse/shared";
@@ -10,16 +10,19 @@ import { ScoresTableCell } from "@/src/components/scores-table-cell";
 import { toOrderedScoresList } from "@/src/features/scores/lib/helpers";
 import { getScoreDataTypeIcon } from "@/src/features/scores/lib/scoreColumns";
 
-// Simple score column creation
-function createScoreColumns<T extends Record<string, any>>(
+// Simple score column creation - exported for reuse
+export function createScoreColumns<T extends Record<string, any>>(
   scoreColumns: Array<{
     key: string;
     name: string;
     source: string;
-    dataType: ScoreDataType;
+    dataType: ScoreDataTypeType;
   }>,
   scoreColumnKey: keyof T & string,
+  displayFormat: "smart" | "aggregate",
   prefix?: string,
+  defaultHidden?: boolean,
+  rawKey?: boolean,
 ): LangfuseColumnDef<T>[] {
   return scoreColumns.map(({ key, name, source, dataType }) => {
     // Apply prefix to both column ID/accessor and header
@@ -33,17 +36,17 @@ function createScoreColumns<T extends Record<string, any>>(
       header,
       id: accessorKey,
       enableHiding: true,
+      defaultHidden,
       size: 150,
       cell: ({ row }) => {
-        // Handle both prefixed and non-prefixed score data access
         const scoresData: ScoreAggregate = row.getValue(scoreColumnKey) ?? {};
-        const value = scoresData[accessorKey];
+        const value = rawKey ? scoresData[key] : scoresData[accessorKey];
 
         if (!value) return null;
 
         return ScoresTableCell({
           aggregate: value,
-          showSingleValue: true,
+          displayFormat,
           hasMetadata: value.hasMetadata ?? false,
         });
       },
@@ -51,6 +54,13 @@ function createScoreColumns<T extends Record<string, any>>(
   });
 }
 
+/**
+ * Hook to fetch and create score columns for tables.
+ *
+ * @param displayFormat Controls how scores are displayed:
+ *   - "smart" (default): Shows single value when there's only one score, aggregate stats when multiple
+ *   - "aggregate": Always shows aggregate format (count, avg, etc.) regardless of score count
+ */
 export function useScoreColumns<T extends Record<string, any>>({
   projectId,
   scoreColumnKey,
@@ -59,6 +69,9 @@ export function useScoreColumns<T extends Record<string, any>>({
   toTimestamp,
   prefix,
   isFilterDataPending = false,
+  displayFormat = "smart",
+  defaultHidden,
+  rawKey = false,
 }: {
   projectId: string;
   scoreColumnKey: keyof T & string;
@@ -67,6 +80,9 @@ export function useScoreColumns<T extends Record<string, any>>({
   toTimestamp?: Date;
   prefix?: string;
   isFilterDataPending?: boolean;
+  displayFormat?: "smart" | "aggregate";
+  defaultHidden?: boolean;
+  rawKey?: boolean;
 }) {
   const scoreColumnsQuery = api.scores.getScoreColumns.useQuery(
     {
@@ -86,9 +102,19 @@ export function useScoreColumns<T extends Record<string, any>>({
     return createScoreColumns<T>(
       toOrderedScoresList(scoreColumnsQuery.data.scoreColumns),
       scoreColumnKey,
+      displayFormat,
       prefix,
+      defaultHidden,
+      rawKey,
     );
-  }, [scoreColumnsQuery.data?.scoreColumns, scoreColumnKey, prefix]);
+  }, [
+    scoreColumnsQuery.data?.scoreColumns,
+    scoreColumnKey,
+    prefix,
+    displayFormat,
+    defaultHidden,
+    rawKey,
+  ]);
 
   return {
     scoreColumns,

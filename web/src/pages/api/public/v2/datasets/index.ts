@@ -4,11 +4,10 @@ import {
   GetDatasetsV2Response,
   PostDatasetsV2Body,
   PostDatasetsV2Response,
-  transformDbDatasetToAPIDataset,
 } from "@/src/features/public-api/types/datasets";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
-import { auditLog } from "@/src/features/audit-logs/auditLog";
+import { createDatasetForApi } from "@/src/features/datasets/server/publicDatasetService";
 
 export default withMiddlewares({
   POST: createAuthedProjectAPIRoute({
@@ -17,38 +16,13 @@ export default withMiddlewares({
     responseSchema: PostDatasetsV2Response,
     rateLimitResource: "datasets",
     fn: async ({ body, auth }) => {
-      const { name, description, metadata } = body;
-
-      const dataset = await prisma.dataset.upsert({
-        where: {
-          projectId_name: {
-            projectId: auth.scope.projectId,
-            name,
-          },
-        },
-        create: {
-          name,
-          description: description ?? undefined,
-          projectId: auth.scope.projectId,
-          metadata: metadata ?? undefined,
-        },
-        update: {
-          description: description ?? null,
-          metadata: metadata ?? undefined,
-        },
-      });
-
-      await auditLog({
-        action: "create",
-        resourceType: "dataset",
-        resourceId: dataset.id,
+      const dataset = await createDatasetForApi({
+        input: body,
         projectId: auth.scope.projectId,
-        orgId: auth.scope.orgId,
-        apiKeyId: auth.scope.apiKeyId,
-        after: dataset,
+        auditScope: auth.scope,
       });
 
-      return transformDbDatasetToAPIDataset(dataset);
+      return dataset;
     },
   }),
   GET: createAuthedProjectAPIRoute({
@@ -62,6 +36,8 @@ export default withMiddlewares({
           name: true,
           description: true,
           metadata: true,
+          inputSchema: true,
+          expectedOutputSchema: true,
           projectId: true,
           createdAt: true,
           updatedAt: true,
@@ -70,9 +46,7 @@ export default withMiddlewares({
         where: {
           projectId: auth.scope.projectId,
         },
-        orderBy: {
-          createdAt: "desc",
-        },
+        orderBy: [{ createdAt: "desc" }, { id: "asc" }],
         take: query.limit,
         skip: (query.page - 1) * query.limit,
       });

@@ -11,12 +11,20 @@ import {
 import { encrypt } from "@langfuse/shared/encryption";
 import { getDisplaySecretKey } from "@/src/features/llm-api-key/server/router";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
+import {
+  InvalidRequestError,
+  BEDROCK_USE_DEFAULT_CREDENTIALS,
+  LLMAdapter,
+} from "@langfuse/shared";
+import { validateLlmConnectionBaseURL } from "@langfuse/shared/src/server";
+import { env } from "@/src/env.mjs";
 
 export default withMiddlewares({
   GET: createAuthedProjectAPIRoute({
     name: "Get LLM Connections",
     querySchema: GetLlmConnectionsV1Query,
     responseSchema: GetLlmConnectionsV1Response,
+    isAdminApiKeyAuthAllowed: true,
     fn: async ({ query, auth }) => {
       const { limit, page } = query;
 
@@ -31,9 +39,10 @@ export default withMiddlewares({
           customModels: true,
           withDefaultModels: true,
           extraHeaderKeys: true,
+          config: true,
           createdAt: true,
           updatedAt: true,
-          // Explicitly exclude: secretKey, extraHeaders, config
+          // Explicitly exclude: secretKey, extraHeaders
         },
         where: {
           projectId: auth.scope.projectId,
@@ -72,6 +81,7 @@ export default withMiddlewares({
     name: "Upsert LLM Connection",
     bodySchema: PutLlmConnectionV1Body,
     responseSchema: PutLlmConnectionV1Response,
+    isAdminApiKeyAuthAllowed: true,
     fn: async ({ body, auth, res }) => {
       const projectId = auth.scope.projectId;
 
@@ -82,10 +92,30 @@ export default withMiddlewares({
             provider: body.provider,
           },
         },
-        select: { id: true },
+        select: { id: true, baseURL: true },
       });
 
       const isUpdate = Boolean(existingConnection);
+
+      if (body.baseURL && body.baseURL !== existingConnection?.baseURL) {
+        try {
+          await validateLlmConnectionBaseURL(body.baseURL);
+        } catch (error) {
+          throw new InvalidRequestError(
+            `Invalid baseURL: ${error instanceof Error ? error.message : "Unknown error"}`,
+          );
+        }
+      }
+
+      const isLangfuseCloud = Boolean(env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION);
+
+      if (body.secretKey === BEDROCK_USE_DEFAULT_CREDENTIALS) {
+        if (isLangfuseCloud || body.adapter !== LLMAdapter.Bedrock) {
+          throw new InvalidRequestError(
+            "Default AWS credentials are only allowed for Bedrock in self-hosted deployments.",
+          );
+        }
+      }
 
       const llmConnectionBody = {
         adapter: body.adapter,
@@ -100,6 +130,7 @@ export default withMiddlewares({
         extraHeaderKeys: body.extraHeaders
           ? Object.keys(body.extraHeaders)
           : [],
+        config: body.config,
       };
 
       // Perform upsert
@@ -125,9 +156,10 @@ export default withMiddlewares({
           customModels: true,
           withDefaultModels: true,
           extraHeaderKeys: true,
+          config: true,
           createdAt: true,
           updatedAt: true,
-          // Explicitly exclude: secretKey, extraHeaders, config
+          // Explicitly exclude: secretKey, extraHeaders
         },
       });
 

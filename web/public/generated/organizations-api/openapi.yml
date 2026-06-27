@@ -1,6 +1,6 @@
 openapi: 3.0.1
 info:
-  title: langfuse-organizations
+  title: organizations
   version: ''
   description: >-
     ## General Notes
@@ -27,9 +27,6 @@ info:
 
     - OpenAPI spec:
     https://cloud.langfuse.com/generated/organizations-api/openapi.yml
-
-    - Postman collection:
-    https://cloud.langfuse.com/generated/organizations-postman/collection.json
 
 
     ## Looking for the Langfuse API?
@@ -455,11 +452,41 @@ components:
           type: object
           additionalProperties: true
           description: Metadata for the organization
+        projects:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrganizationProject'
       required:
         - id
         - name
         - createdAt
         - metadata
+        - projects
+    OrganizationProject:
+      title: OrganizationProject
+      type: object
+      description: Project belonging to an organization
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Metadata for the project
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required:
+        - id
+        - name
+        - createdAt
+        - updatedAt
     DeleteOrganizationResponse:
       title: DeleteOrganizationResponse
       type: object
