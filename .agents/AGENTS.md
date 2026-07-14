@@ -115,3 +115,11 @@ regenerated outputs. Never hand-edit `generated/**`.
 - Generated provider config and shim outputs under `.claude/`, `.cursor/`,
   `.codex/`, `.vscode/`, or `.mcp.json` are local artifacts, not source of
   truth files.
+
+## 🔌 VS Code / Continue Integration
+
+When implementing features related to editor integrations:
+* Reference the cloned companion workspace at `/Users/gmtange/Projects/ai/continue`.
+* Utilize **Langfuse Prompt Management** (CRUD endpoints in `web/src/server/api/routers/prompts.ts`) to serve prompt variations dynamically to the Continue client extension.
+* Keep the integration interface generic, ensuring Continue can query and save traces without polluting the core database schemas.
+

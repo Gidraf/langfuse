@@ -20,6 +20,7 @@ import {
   ClipboardPen,
   Clock,
   Beaker,
+  ShieldAlert,
 } from "lucide-react";
 import { type ReactNode } from "react";
 import { type Entitlement } from "@/src/features/entitlements/constants/entitlements";
@@ -102,6 +103,13 @@ export const ROUTES: Route[] = [
     icon: LayoutDashboard,
     productModule: "dashboards",
     section: RouteSection.Main,
+  },
+  {
+    title: "Production Investigations",
+    pathname: `/project/[projectId]/investigations`,
+    icon: ShieldAlert,
+    section: RouteSection.Main,
+    label: "Beta",
   },
   {
     title: "Tracing",
