@@ -1,7 +1,13 @@
 import { z } from "zod";
-import { createTRPCRouter, protectedProjectProcedure } from "@/src/server/api/trpc";
+import {
+  createTRPCRouter,
+  protectedProjectProcedure,
+} from "@/src/server/api/trpc";
 import { prisma } from "@langfuse/shared/src/db";
-import { runInvestigation, type IncidentTemplate } from "@/src/features/production-investigations/server/runner";
+import {
+  runInvestigation,
+  type IncidentTemplate,
+} from "@/src/features/production-investigations/server/runner";
 import { fetchLLMCompletion } from "@langfuse/shared/src/server/llm/fetchLLMCompletion";
 
 export const investigationsRouter = createTRPCRouter({
@@ -9,7 +15,7 @@ export const investigationsRouter = createTRPCRouter({
     .input(
       z.object({
         projectId: z.string(),
-      })
+      }),
     )
     .query(async ({ input }) => {
       return prisma.investigation.findMany({
@@ -23,7 +29,7 @@ export const investigationsRouter = createTRPCRouter({
       z.object({
         projectId: z.string(),
         id: z.string(),
-      })
+      }),
     )
     .query(async ({ input }) => {
       const investigation = await prisma.investigation.findUnique({
@@ -49,7 +55,7 @@ export const investigationsRouter = createTRPCRouter({
           "LLM_HALLUCINATION",
           "DB_CONNECTION_FAIL",
         ]),
-      })
+      }),
     )
     .mutation(async ({ input }) => {
       const investigation = await prisma.investigation.create({
@@ -61,15 +67,19 @@ export const investigationsRouter = createTRPCRouter({
             input.template === "K8S_CRASHLOOP"
               ? "CRITICAL"
               : input.template === "PAYMENT_API_LATENCY" ||
-                input.template === "REDIS_OUTAGE" ||
-                input.template === "DB_CONNECTION_FAIL"
-              ? "HIGH"
-              : "MEDIUM",
+                  input.template === "REDIS_OUTAGE" ||
+                  input.template === "DB_CONNECTION_FAIL"
+                ? "HIGH"
+                : "MEDIUM",
         },
       });
 
       // Execute runner asynchronously in the background
-      runInvestigation(input.projectId, investigation.id, input.template as IncidentTemplate).catch((err) => {
+      runInvestigation(
+        input.projectId,
+        investigation.id,
+        input.template as IncidentTemplate,
+      ).catch((err) => {
         console.error("Error executing background investigation:", err);
       });
 
@@ -82,7 +92,7 @@ export const investigationsRouter = createTRPCRouter({
         projectId: z.string(),
         investigationId: z.string(),
         message: z.string(),
-      })
+      }),
     )
     .mutation(async ({ input }) => {
       // 1. Save user message
@@ -111,29 +121,40 @@ export const investigationsRouter = createTRPCRouter({
       try {
         const evidenceStr = JSON.stringify(investigation.evidence, null, 2);
         const systemPrompt = `You are an expert production systems engineer. Help the developer investigate this incident. Answer their question based on the collected evidence.\nEvidence Context:\n${evidenceStr}`;
-        
+
         const response = await fetchLLMCompletion({
           model: {
             provider: "openai",
-            modelName: "qwen2.5:0.5b"
+            modelName: "qwen2.5:0.5b",
           },
           systemPrompt,
           userPrompt: input.message,
-          temperature: 0.7
+          temperature: 0.7,
         });
 
         if (typeof response === "string") {
           replyContent = response;
-        } else if (response && typeof response === "object" && "text" in response) {
+        } else if (
+          response &&
+          typeof response === "object" &&
+          "text" in response
+        ) {
           replyContent = (response as any).text;
         }
       } catch (_err) {
         // Fallback responder replies
-        if (input.message.toLowerCase().includes("why") || input.message.toLowerCase().includes("happen")) {
+        if (
+          input.message.toLowerCase().includes("why") ||
+          input.message.toLowerCase().includes("happen")
+        ) {
           const rep = investigation.report as any;
           replyContent = `Based on the evidence logs, the incident occurred due to: ${rep?.rootCause || "a service timeout error"}. The executive summary is: ${rep?.executiveSummary || "investigation in progress"}.`;
-        } else if (input.message.toLowerCase().includes("fix") || input.message.toLowerCase().includes("recommend")) {
-          replyContent = "Here are the recommended code fixes:\n\n1. Review connection pools and apply exponential backoff retries.\n2. Ensure singletons are used for DB client configurations.\n3. Run validation logic before invoking API integrations.";
+        } else if (
+          input.message.toLowerCase().includes("fix") ||
+          input.message.toLowerCase().includes("recommend")
+        ) {
+          replyContent =
+            "Here are the recommended code fixes:\n\n1. Review connection pools and apply exponential backoff retries.\n2. Ensure singletons are used for DB client configurations.\n3. Run validation logic before invoking API integrations.";
         } else {
           replyContent = `I've analyzed the logs and traces for "${investigation.title}". Let me know if you would like me to explain the stack trace, generate unit tests, or write a pull request description for this incident.`;
         }

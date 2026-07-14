@@ -4,7 +4,10 @@ import { prisma } from "@langfuse/shared/src/db";
 import { redis, traceException } from "@langfuse/shared/src/server";
 import { UnauthorizedError, ForbiddenError } from "@langfuse/shared";
 import { type NextApiRequest, type NextApiResponse } from "next";
-import { runInvestigation, type IncidentTemplate } from "@/src/features/production-investigations/server/runner";
+import {
+  runInvestigation,
+  type IncidentTemplate,
+} from "@/src/features/production-investigations/server/runner";
 import { z } from "zod";
 
 const CreateInvestigationSchema = z.object({
@@ -21,7 +24,7 @@ const CreateInvestigationSchema = z.object({
 
 export default async function handler(
   req: NextApiRequest,
-  res: NextApiResponse
+  res: NextApiResponse,
 ) {
   await runMiddleware(req, res, cors);
 
@@ -29,7 +32,7 @@ export default async function handler(
     // 1. Auth check
     const authCheck = await new ApiAuthService(
       prisma,
-      redis
+      redis,
     ).verifyAuthHeaderAndReturnScope(req.headers.authorization);
 
     if (!authCheck.validKey) throw new UnauthorizedError(authCheck.error);
@@ -38,7 +41,7 @@ export default async function handler(
       !authCheck.scope.projectId
     ) {
       throw new ForbiddenError(
-        "Access denied: Bearer auth and org api keys are not allowed to access"
+        "Access denied: Bearer auth and org api keys are not allowed to access",
       );
     }
 
@@ -83,23 +86,29 @@ export default async function handler(
             (body.template === "K8S_CRASHLOOP"
               ? "CRITICAL"
               : body.template === "PAYMENT_API_LATENCY" ||
-                body.template === "REDIS_OUTAGE" ||
-                body.template === "DB_CONNECTION_FAIL"
-              ? "HIGH"
-              : "MEDIUM"),
+                  body.template === "REDIS_OUTAGE" ||
+                  body.template === "DB_CONNECTION_FAIL"
+                ? "HIGH"
+                : "MEDIUM"),
         },
       });
 
       // Execute reasoning runner in the background
-      runInvestigation(projectId, investigation.id, body.template as IncidentTemplate).catch((err) => {
-        console.error("Error executing background investigation from API:", err);
+      runInvestigation(
+        projectId,
+        investigation.id,
+        body.template as IncidentTemplate,
+      ).catch((err) => {
+        console.error(
+          "Error executing background investigation from API:",
+          err,
+        );
       });
 
       return res.status(201).json(investigation);
     }
 
     return res.status(405).json({ message: "Method Not Allowed" });
-
   } catch (err: any) {
     traceException(err);
     if (err instanceof UnauthorizedError) {
@@ -109,7 +118,9 @@ export default async function handler(
       return res.status(403).json({ message: err.message });
     }
     if (err instanceof z.ZodError) {
-      return res.status(400).json({ message: "Invalid payload parameters", errors: err.errors });
+      return res
+        .status(400)
+        .json({ message: "Invalid payload parameters", errors: err.errors });
     }
     return res.status(500).json({ message: "Internal server error" });
   }
