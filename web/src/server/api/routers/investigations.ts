@@ -8,7 +8,7 @@ import {
   runInvestigation,
   type IncidentTemplate,
 } from "@/src/features/production-investigations/server/runner";
-import { fetchLLMCompletion } from "@langfuse/shared/src/server/llm/fetchLLMCompletion";
+import { fetchLLMCompletion } from "@langfuse/shared/src/server";
 
 export const investigationsRouter = createTRPCRouter({
   list: protectedProjectProcedure

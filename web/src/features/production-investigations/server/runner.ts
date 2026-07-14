@@ -1,5 +1,5 @@
 import { prisma } from "@langfuse/shared/src/db";
-import { fetchLLMCompletion } from "@langfuse/shared/src/server/llm/fetchLLMCompletion";
+import { fetchLLMCompletion } from "@langfuse/shared/src/server";
 
 export type IncidentTemplate =
   | "PAYMENT_API_LATENCY"
