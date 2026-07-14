@@ -2,7 +2,9 @@ version: "3.9"
 
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
     restart: always
     depends_on:
       clickhouse:
@@ -73,7 +75,9 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3
+    build:
+      context: .
+      dockerfile: ./web/Dockerfile
     restart: always
     depends_on:
       clickhouse:
