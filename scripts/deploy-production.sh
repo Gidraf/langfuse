@@ -22,7 +22,7 @@ DB_URL="postgresql://postgres:Winners1127@127.0.0.1:5432/langfuse"
 if [ -f .env ]; then
   echo -e "${YELLOW}Loading database configuration from .env file...${NC}"
   # Extract DATABASE_URL from .env if present
-  DB_URL_ENV=$(grep -E "^DATABASE_URL=" .env | cut -d'="' -f2 | cut -d'"' -f1)
+  DB_URL_ENV=$(grep -E "^DATABASE_URL=" .env | cut -d'=' -f2 | tr -d '"' | tr -d "'")
   if [ -n "$DB_URL_ENV" ]; then
     DB_URL="$DB_URL_ENV"
   fi
