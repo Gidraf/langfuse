@@ -19,7 +19,7 @@ services:
       NEXTAUTH_URL: https://langfuse.cvpap.store
 
       # === DATABASE (External Postgres) ===
-      DATABASE_URL: postgresql://postgres:Winners1127@host.docker.internal:5432/langfuse
+      DATABASE_URL: ${DATABASE_URL}
 
       # === Redis (Internal and isolated on port 6380) ===
       REDIS_HOST: redis6380
