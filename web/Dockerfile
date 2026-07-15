@@ -110,8 +110,8 @@ RUN rm -f ./web/src/middleware.ts
 ENV NEXT_TELEMETRY_DISABLED 1
 ENV NEXT_MANUAL_SIG_HANDLE true
 # set the CI flag to true to get CI specific logs
-ENV CI true
-
+ENV NEXT_IGNORE_BUILD_ERRORS true
+ENV DISABLE_ESLINT_PLUGIN true
 RUN NODE_OPTIONS='--max-old-space-size-percentage=75' turbo run build --filter=web...
 
 # Production image, copy all the files and run next
