@@ -58,6 +58,7 @@ docker run --rm \
   -v "$(pwd)":/app \
   -w /app \
   --network "$NETWORK_NAME" \
+  --add-host=host.docker.internal:host-gateway \
   node:22-alpine \
   sh -c "apk add --no-cache bash && npm install -g pnpm && pnpm install --filter=@langfuse/shared && DATABASE_URL=\"$DB_URL\" DIRECT_URL=\"$DB_URL\" npx prisma db push --schema=packages/shared/prisma/schema.prisma --accept-data-loss"
 
