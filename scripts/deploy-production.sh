@@ -37,7 +37,7 @@ docker run --rm \
   -w /app \
   --network host \
   node:22-alpine \
-  sh -c "npm install -g pnpm && pnpm install --filter=@langfuse/shared && DATABASE_URL=\"$DB_URL\" DIRECT_URL=\"$DB_URL\" npx prisma db push --schema=packages/shared/prisma/schema.prisma --accept-data-loss"
+  sh -c "apk add --no-cache bash && npm install -g pnpm && pnpm install --filter=@langfuse/shared && DATABASE_URL=\"$DB_URL\" DIRECT_URL=\"$DB_URL\" npx prisma db push --schema=packages/shared/prisma/schema.prisma --accept-data-loss"
 
 echo -e "${GREEN}✓ Database tables successfully updated!${NC}"
 
